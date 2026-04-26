@@ -15,30 +15,77 @@ Two config profiles:
 
 ---
 
+## Environment
+
+Must run on an **NVIDIA GPU** (H100 recommended) with:
+
+| Package | Version | Why |
+|---|---|---|
+| Python | 3.10 | `fla-core` warns but works |
+| `torch` | 2.7.1+cu128 | Driver 535 compatibility |
+| `fla-core` | >= 0.4.0, < 0.5 | KDA kernel implementation |
+| `transformers` | >= 4.55, < 4.57 | `modeling_kimi.py` imports |
+| `triton` | 3.3.1 | fla dependency |
+| `einops` | >= 0.8 | Tensor reshaping |
+| `safetensors` | any | HF weight loading (real config only) |
+
+Install:
+
+```bash
+pip install 'torch==2.7.1' --index-url https://download.pytorch.org/whl/cu128
+pip install 'fla-core>=0.4.0,<0.5' 'transformers>=4.55,<4.57' einops safetensors
+```
+
+Also needs `modeling_kimi.py` + `configuration_kimi.py` from
+[moonshotai/Kimi-Linear-48B-A3B-Instruct](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct)
+accessible on `sys.path` (parent dir, `~/kda_repro/`, or alongside this script).
+
+---
+
 ## Quick start
 
 Two scripts, run in order:
 
 ```bash
 # Step 1: extract weights → weights.npz
-python dump_weights_KDA.py --config small                    # random init
+python dump_weights_KDA.py --config small
 python dump_weights_KDA.py --config real --hf-dir /path/to/Kimi-Linear-48B-A3B-Instruct
 
 # Step 2: run 12 cases → case_*.npz + sanity table
-python dump_io_KDAforward.py --weights dumps/weights.npz          # small
-python dump_io_KDAforward.py --weights dumps_real/weights.npz     # real
+python dump_io_KDAforward.py --weights dumps/weights.npz
+python dump_io_KDAforward.py --weights dumps_real/weights.npz
 ```
 
-`dump_weights_KDA.py` options:
+### `dump_weights_KDA.py`
 
 ```
 --config {small,real}   Config profile (default: small)
 --hf-dir PATH           HF checkpoint dir (required for real)
---layer-idx N           Which KDA layer to extract (default: 0)
---output PATH           Override output path
+--layer-idx N [N ...]   0-based layer index(es) (default: 0)
+--all-kda-layers        Dump all KDA layers from config.json
+--output-dir PATH       Override output directory
 ```
 
-`dump_io_KDAforward.py` options:
+Single layer → `weights.npz`. Multiple layers → `weights_L{N}.npz` each.
+
+> **Layer numbering**: `config.json` uses **1-based** `kda_layers` (`[1, 2, 3, ...]`),
+> but `--layer-idx` uses **0-based** (matching `model.layers.{N}` in safetensors).
+> So `kda_layers=[1]` corresponds to `--layer-idx 0`.
+
+Examples:
+
+```bash
+# Single layer (default: layer 0, the first KDA layer)
+python dump_weights_KDA.py --config real --hf-dir /path/to/checkpoint
+
+# Specific layers
+python dump_weights_KDA.py --config real --hf-dir /path/to/checkpoint --layer-idx 0 1 2
+
+# All 20 KDA layers
+python dump_weights_KDA.py --config real --hf-dir /path/to/checkpoint --all-kda-layers
+```
+
+### `dump_io_KDAforward.py`
 
 ```
 --weights PATH          Path to weights.npz (required)
@@ -52,8 +99,7 @@ python dump_io_KDAforward.py --weights dumps_real/weights.npz     # real
 ```python
 import numpy as np
 
-# Pick the right dumps dir for your profile
-w = np.load("kda_gpu/dumps/weights.npz")        # or dumps_real/
+w = np.load("kda_gpu/dumps/weights.npz")
 d = np.load("kda_gpu/dumps/case_single_T128.npz")
 
 # End-to-end check
@@ -106,7 +152,7 @@ Each case dumps: fp32 chunk intermediates, fp32 fused_recurrent output, bf16 out
 
 ## NPZ schema
 
-**`weights.npz`** — shared weights + config metadata (`config__*`) + env snapshot (`env__*`).
+**`weights.npz`** (or `weights_L{N}.npz`) — weights + config metadata (`config__*`, including `config__layer_idx`) + env snapshot (`env__*`).
 
 Weight keys: `weights__{param_name}` — same names as `module.named_parameters()`:
 `q_proj.weight`, `k_proj.weight`, `v_proj.weight`, `{q,k,v}_conv1d.weight`,
@@ -121,32 +167,6 @@ Weight keys: `weights__{param_name}` — same names as `module.named_parameters(
 | Inputs | `hidden_states`, `cu_seqlens`?, `initial_recurrent_state`? |
 | Intermediates | `intermediates__{q,k,v}_after_conv`, `intermediates__g`, `intermediates__beta`, `intermediates__o_kda_chunk`, `intermediates__recurrent_state_chunk`, `intermediates__o_kda_fused_recurrent`, `intermediates__recurrent_state_fused_recurrent`, `intermediates__g_out`, `intermediates__o_norm` |
 | Outputs | `out_fp32`, `out_bf16` |
-
----
-
-## Replay (H100)
-
-```bash
-# 1) push code
-rsync -avz --exclude __pycache__ --exclude 'dumps*' \
-  kda_gpu/ h100-yuhao:~/kda_repro/kda_gpu/
-
-# 2) small config
-ssh h100-yuhao "conda activate sgl_gpu_runtime && cd ~/kda_repro/kda_gpu && \
-  python dump_weights_KDA.py --config small && \
-  python dump_io_KDAforward.py --weights dumps/weights.npz 2>&1 | tee run.log"
-
-# 3) real config (needs HF checkpoint)
-ssh h100-yuhao "conda activate sgl_gpu_runtime && cd ~/kda_repro/kda_gpu && \
-  python dump_weights_KDA.py --config real --hf-dir ~/models/Kimi-Linear-48B-A3B-Instruct && \
-  python dump_io_KDAforward.py --weights dumps_real/weights.npz 2>&1 | tee run_real.log"
-
-# 4) pull results
-scp -r h100-yuhao:~/kda_repro/kda_gpu/dumps/ kda_gpu/
-scp -r h100-yuhao:~/kda_repro/kda_gpu/dumps_real/ kda_gpu/
-```
-
-H100 env setup and pin rationale: see `DESIGN.md`.
 
 ---
 
