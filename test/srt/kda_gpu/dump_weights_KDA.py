@@ -5,10 +5,16 @@ Two modes:
   --config small   Random init (hidden=128, heads=4, head_dim=32)
   --config real    Real weights from HF safetensors (hidden=2304, heads=32, head_dim=128)
 
-Output: weights.npz containing config metadata (config__*), env snapshot
-(env__*), and all module parameters (weights__*).
+Supports single or multiple layers:
+  --layer-idx 0              Single layer → weights.npz
+  --layer-idx 0 2 4          Multiple layers → weights_L0.npz, weights_L2.npz, ...
+  --all-kda-layers           All KDA layers from config.json → weights_L{N}.npz each
 
-dump_io_KDAforward.py consumes this file to run the 12-case dump.
+Note: config.json's kda_layers uses 1-based numbering, but --layer-idx
+uses 0-based (matching model.layers.{N} in safetensors). The mapping is:
+  kda_layers=[1,2,3,...] → layer_idx=0,1,2,...
+
+dump_io_KDAforward.py consumes weights.npz files to run the 12-case dump.
 """
 
 from __future__ import annotations
@@ -111,6 +117,20 @@ def _build_config(profile: ConfigProfile):
         ),
         vocab_size=1000,
     )
+
+
+def _get_kda_layer_indices(hf_dir: str) -> list[int]:
+    """Read config.json and return 0-based layer indices for all KDA layers.
+
+    config.json's kda_layers uses 1-based numbering, so we subtract 1.
+    """
+    config_path = Path(hf_dir) / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Expected {config_path}")
+    with open(config_path) as f:
+        cfg = json.load(f)
+    kda_layers_1based = cfg.get("linear_attn_config", {}).get("kda_layers", [])
+    return sorted(layer_1b - 1 for layer_1b in kda_layers_1based)
 
 
 def _load_hf_weights(
@@ -226,6 +246,44 @@ def _t2np(t: torch.Tensor) -> np.ndarray:
     return t.detach().float().cpu().numpy()
 
 
+def _dump_one_layer(
+    profile: ConfigProfile,
+    layer_idx: int,
+    out_path: Path,
+    hf_dir: str | None = None,
+) -> None:
+    """Dump weights for a single layer to out_path."""
+    print(f"\n--- layer {layer_idx} ---")
+    m = _build_module(profile, hf_dir=hf_dir, layer_idx=layer_idx)
+
+    payload: dict = {
+        "config__profile": np.asarray(profile.name),
+        "config__hidden_size": np.asarray(profile.hidden_size),
+        "config__num_heads": np.asarray(profile.num_heads),
+        "config__head_dim": np.asarray(profile.head_dim),
+        "config__conv_size": np.asarray(profile.conv_size),
+        "config__rms_norm_eps": np.asarray(profile.rms_norm_eps),
+        "config__seed": np.asarray(profile.seed),
+        "config__layer_idx": np.asarray(layer_idx),
+    }
+    for k, v in env_snapshot().items():
+        payload[f"env__{k}"] = np.asarray(v)
+
+    weight_keys = []
+    for name, p in m.named_parameters():
+        payload[f"weights__{name}"] = _t2np(p)
+        weight_keys.append((name, tuple(p.shape), str(p.dtype)))
+
+    np.savez(out_path, **payload)
+    print(f"[weights] -> {out_path}  ({len(payload)} arrays, "
+          f"{out_path.stat().st_size / 1024:.1f} KiB)")
+    for n, sh, dt in weight_keys:
+        print(f"  {n:<28s} {sh} {dt}")
+
+    del m
+    torch.cuda.empty_cache()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -242,17 +300,29 @@ def parse_args() -> argparse.Namespace:
         "--hf-dir", type=str, default=None,
         help="HF checkpoint directory (required for --config real).",
     )
-    parser.add_argument(
-        "--layer-idx", type=int, default=0,
-        help="HF layer index to extract (default: 0).",
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--layer-idx", type=int, nargs="+", default=None,
+        help="0-based layer index(es) to extract. Note: config.json uses "
+             "1-based kda_layers, so kda_layers=[1,2,3] → --layer-idx 0 1 2. "
+             "Default: 0.",
+    )
+    group.add_argument(
+        "--all-kda-layers", action="store_true",
+        help="Dump all KDA layers (reads kda_layers from config.json). "
+             "Requires --hf-dir.",
     )
     parser.add_argument(
-        "--output", type=str, default=None,
-        help="Output path. Default: dumps/weights.npz or dumps_real/weights.npz.",
+        "--output-dir", type=str, default=None,
+        help="Output directory. Default: dumps/ (small) or dumps_real/ (real).",
     )
     args = parser.parse_args()
     if args.config == "real" and args.hf_dir is None:
         parser.error("--hf-dir is required when --config real")
+    if args.all_kda_layers and args.hf_dir is None:
+        parser.error("--all-kda-layers requires --hf-dir")
+    if args.layer_idx is None and not args.all_kda_layers:
+        args.layer_idx = [0]
     return args
 
 
@@ -260,48 +330,40 @@ def main():
     args = parse_args()
     profile = REAL_CONFIG if args.config == "real" else SMALL_CONFIG
 
-    if args.output:
-        out_path = Path(args.output)
+    if args.output_dir:
+        dumps_dir = Path(args.output_dir)
     else:
         dumps_dir = HERE / ("dumps_real" if args.config == "real" else "dumps")
-        dumps_dir.mkdir(exist_ok=True, parents=True)
-        out_path = dumps_dir / "weights.npz"
-
-    out_path.parent.mkdir(exist_ok=True, parents=True)
+    dumps_dir.mkdir(exist_ok=True, parents=True)
 
     assert torch.cuda.is_available(), "This script expects a CUDA device"
 
-    print(f"=== dump_weights: config={profile.name} ===")
+    # Resolve layer indices
+    if args.all_kda_layers:
+        layer_indices = _get_kda_layer_indices(args.hf_dir)
+        print(f"=== dump_weights_KDA: config={profile.name}, "
+              f"all KDA layers ({len(layer_indices)}) ===")
+    else:
+        layer_indices = args.layer_idx
+        print(f"=== dump_weights_KDA: config={profile.name}, "
+              f"layer(s)={layer_indices} ===")
+
     print(f"  hidden_size={profile.hidden_size}  num_heads={profile.num_heads}  "
           f"head_dim={profile.head_dim}")
     if args.config == "real":
-        print(f"  hf_dir={args.hf_dir}  layer_idx={args.layer_idx}")
+        print(f"  hf_dir={args.hf_dir}")
+    print(f"  output_dir={dumps_dir}")
 
-    m = _build_module(profile, hf_dir=args.hf_dir, layer_idx=args.layer_idx)
+    # Dump each layer
+    single = len(layer_indices) == 1
+    for layer_idx in layer_indices:
+        if single:
+            out_path = dumps_dir / "weights.npz"
+        else:
+            out_path = dumps_dir / f"weights_L{layer_idx}.npz"
+        _dump_one_layer(profile, layer_idx, out_path, hf_dir=args.hf_dir)
 
-    # Assemble payload
-    payload: dict = {
-        "config__profile": np.asarray(profile.name),
-        "config__hidden_size": np.asarray(profile.hidden_size),
-        "config__num_heads": np.asarray(profile.num_heads),
-        "config__head_dim": np.asarray(profile.head_dim),
-        "config__conv_size": np.asarray(profile.conv_size),
-        "config__rms_norm_eps": np.asarray(profile.rms_norm_eps),
-        "config__seed": np.asarray(profile.seed),
-    }
-    for k, v in env_snapshot().items():
-        payload[f"env__{k}"] = np.asarray(v)
-
-    weight_keys = []
-    for name, p in m.named_parameters():
-        payload[f"weights__{name}"] = _t2np(p)
-        weight_keys.append((name, tuple(p.shape), str(p.dtype)))
-
-    np.savez(out_path, **payload)
-    print(f"\n[weights] -> {out_path}  ({len(payload)} arrays, "
-          f"{out_path.stat().st_size / 1024:.1f} KiB)")
-    for n, sh, dt in weight_keys:
-        print(f"  {n:<28s} {sh} {dt}")
+    print(f"\nDone: {len(layer_indices)} layer(s) dumped to {dumps_dir}")
 
 
 if __name__ == "__main__":
