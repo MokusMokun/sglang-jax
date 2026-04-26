@@ -170,6 +170,38 @@ Weight keys: `weights__{param_name}` — same names as `module.named_parameters(
 
 ---
 
+## Pre-generated dumps (GCS)
+
+Real-config dumps (HF weights, 4 KDA layers evenly spaced) are on GCS:
+
+```
+gs://model-storage-sglang/yuhao/kimi-linear/kda_module/
+├── L0/           # layer 0  (early)
+├── L6/           # layer 6  (early-mid)
+├── L13/          # layer 13 (mid)
+└── L22/          # layer 22 (late)
+    ├── weights.npz              ~151 MiB
+    ├── case_single_T1.npz
+    ├── case_single_T8.npz
+    ├── case_single_T64.npz
+    ├── case_single_T65.npz
+    ├── case_single_T128.npz
+    ├── case_single_T256.npz
+    ├── case_single_T1024.npz    ~160 MiB
+    ├── case_varlen_balanced_4x32.npz
+    ├── case_varlen_unbalanced.npz
+    ├── case_varlen_single_T128.npz
+    ├── case_single_T128_initstate.npz
+    └── case_varlen_initstate.npz
+```
+
+All 4 layers: **12/12 cases passed** (chunk vs fused_recurrent max abs diff < 1e-3).
+Total: ~2.2 GiB across 4 layers.
+
+On GCE VMs with GCS FUSE mount, access at `/models/yuhao/kimi-linear/kda_module/`.
+
+---
+
 ## Caveats
 
 1. `modeling_kimi.py:560` is broken upstream — `fixed_kda_module.py` works around it
