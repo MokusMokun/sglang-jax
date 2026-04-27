@@ -37,6 +37,10 @@ from sgl_jax.srt.layers.attention.linear.kda_backend import (
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
 
+# LinearBase requires an ambient mesh context for PartitionSpec.
+_TEST_MESH = jax.sharding.Mesh(jax.devices()[:1], ("tensor",))
+jax.set_mesh(_TEST_MESH)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -132,7 +136,7 @@ def _build_extend_env(
     cu_seqlens: jax.Array | None = None,
 ) -> tuple[ForwardBatch, MockRecurrentStatePool]:
     """Build EXTEND ForwardBatch + pool for one or more sequences."""
-    H, K, V = module.num_heads, module.head_k_dim, module.head_dim
+    H, K, V = module.num_heads, module.k_head_dim, module.head_dim
     if cu_seqlens is None:
         cu_seqlens = jnp.array([0, T], dtype=jnp.int32)
     N = cu_seqlens.shape[0] - 1
@@ -155,7 +159,7 @@ def _build_extend_env(
     if init_state is None:
         init_state = jnp.zeros((N, H, K, V), dtype=jnp.float32)
     pool = MockRecurrentStatePool(
-        layer_caches={module.layer_id: (init_state, None)},
+        layer_caches={module.layer_idx: (init_state, None)},
     )
     return fb, pool
 
@@ -260,7 +264,7 @@ def _report_intermediates(case: dict, module, forward_batch, pool):
 
     backend = forward_batch.attn_backend
     recurrent_indices = backend.forward_metadata.recurrent_indices
-    _, conv_cache = backend._get_layer_cache(pool, module.layer_id)
+    _, conv_cache = backend._get_layer_cache(pool, module.layer_idx)
     q_w, k_w, v_w = backend._get_conv_weights(module.attn)
     conv_size = q_w.shape[-1]
     q_state, k_state, v_state = backend._get_conv_states(
