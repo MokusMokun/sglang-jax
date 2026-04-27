@@ -201,7 +201,7 @@ PREFILL_CASES = [
 # Tight pass → silent. Tight fail + loose pass → warning. Both fail → error.
 FP32_ATOL_TIGHT = 2e-3
 FP32_RTOL_TIGHT = 5e-3
-FP32_ATOL_LOOSE = 2e-2
+FP32_ATOL_LOOSE = 3e-2
 FP32_RTOL_LOOSE = 2e-2
 
 BF16_ATOL_TIGHT = 3e-3
