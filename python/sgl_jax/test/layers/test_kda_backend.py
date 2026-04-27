@@ -92,6 +92,7 @@ def _build_module(
 
     num_heads = config.linear_attn_config["num_heads"]
 
+    # Linear projections: GPU dumps are [out, in], LinearBase expects [in, out].
     weight_map = {
         "q_proj.weight": "weights__q_proj.weight",
         "k_proj.weight": "weights__k_proj.weight",
@@ -105,13 +106,17 @@ def _build_module(
         "o_norm.weight": "weights__o_norm.weight",
     }
     for attr, key in weight_map.items():
-        _set_param(module, attr, weights[key])
+        w = weights[key]
+        if attr != "o_norm.weight":
+            w = w.T
+        _set_param(module, attr, w)
 
+    # Conv weights: GPU dumps are [channels, (1,) kernel], LinearBase is [kernel, channels].
     for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
         w = weights[f"weights__{name}.weight"]
         if w.ndim == 3 and w.shape[1] == 1:
             w = w[:, 0, :]
-        _set_param(module, f"{name}.weight", w)
+        _set_param(module, f"{name}.weight", w.T)
 
     a_log = weights["weights__A_log"]
     _set_param(module, "A_log", a_log.reshape(1, 1, num_heads, 1))
@@ -238,16 +243,36 @@ def _assert_two_tier(
 
 
 def _report_intermediates(case: dict, module, forward_batch, pool):
-    """Print per-step max-abs-diff for debugging prefill divergence."""
-    hidden = jnp.asarray(case["hidden_states"], dtype=jnp.float32)
-    hidden_2d, _ = module._flatten_hidden_states(hidden)
+    """Print per-step max-abs-diff for debugging prefill divergence.
 
-    q = module.q_proj(hidden_2d)
-    k = module.k_proj(hidden_2d)
-    v = module.v_proj(hidden_2d)
-    q, k, v = module._short_convs(q, k, v, forward_batch, pool)
-    q_heads = module._split_heads(q, module.num_k_heads, module.head_k_dim)
-    k_heads = module._split_heads(k, module.num_k_heads, module.head_k_dim)
+    Conv and L2 norm now live in the backend; this helper runs the backend's
+    internal steps to extract intermediates.
+    """
+    from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+
+    hidden = jnp.asarray(case["hidden_states"], dtype=jnp.float32)
+    if hidden.ndim == 3:
+        hidden = hidden[0]
+
+    q, _ = module.q_proj(hidden)
+    k, _ = module.k_proj(hidden)
+    v, _ = module.v_proj(hidden)
+
+    backend = forward_batch.attn_backend
+    recurrent_indices = backend.forward_metadata.recurrent_indices
+    _, conv_cache = backend._get_layer_cache(pool, module.layer_id)
+    q_w, k_w, v_w = backend._get_conv_weights(module.attn)
+    conv_size = q_w.shape[-1]
+    q_state, k_state, v_state = backend._get_conv_states(
+        conv_cache, recurrent_indices, q.shape[-1], conv_size, q_w.dtype,
+    )
+    activation = module.attn.activation or jax.nn.silu
+    cu_seqlens = backend.forward_metadata.cu_q_lens
+    q_conv, _ = KDAAttnBackend._extend_conv(q, q_w, q_state, cu_seqlens, conv_size, activation)
+    k_conv, _ = KDAAttnBackend._extend_conv(k, k_w, k_state, cu_seqlens, conv_size, activation)
+
+    q_heads = module._split_heads(q_conv, module.num_k_heads, module.head_k_dim)
+    k_heads = module._split_heads(k_conv, module.num_k_heads, module.head_k_dim)
 
     for label, actual, key in [
         ("q_after_conv", q_heads, "intermediates__q_after_conv"),
@@ -302,6 +327,8 @@ class TestKDAPrefill:
         )
 
         hidden = jnp.asarray(case["hidden_states"], dtype=jnp.float32)
+        if hidden.ndim == 3:
+            hidden = hidden[0]
         output = module(hidden, None, forward_batch, pool)
         output_np = np.asarray(output, dtype=np.float32)
 
@@ -364,6 +391,8 @@ class TestKDAPrefill:
         )
 
         hidden = jnp.asarray(case["hidden_states"], dtype=jnp.bfloat16)
+        if hidden.ndim == 3:
+            hidden = hidden[0]
         output = module_bf16(hidden, None, forward_batch, pool)
         output_np = np.asarray(output, dtype=np.float32)
 
@@ -429,7 +458,8 @@ class TestKDADecode:
         """Prefill T-1 tokens, decode the T-th, return decode output."""
         T = int(case["T"])
         hidden = jnp.asarray(case["hidden_states"], dtype=in_dtype)
-        hidden_2d = hidden[0] if hidden.ndim == 3 else hidden  # [T, D]
+        if hidden.ndim == 3:
+            hidden = hidden[0]  # [T, D]
 
         has_init = bool(case["has_initial_state"])
         init_state = (
@@ -439,14 +469,12 @@ class TestKDADecode:
 
         # 1) Prefill T-1 tokens → state (recurrent + conv)
         fb_prefix, pool_prefix = _build_extend_env(module, T - 1, init_state)
-        _ = module(hidden_2d[: T - 1][None], None, fb_prefix, pool_prefix)
+        _ = module(hidden[: T - 1], None, fb_prefix, pool_prefix)
 
         # 2) Decode the T-th token using the state from step 1
         fb_decode = _build_decode_env(module, pool_prefix, B=1)
-        out_decode = module(hidden_2d[T - 1 : T][None], None, fb_decode, pool_prefix)
+        out_decode = module(hidden[T - 1 : T], None, fb_decode, pool_prefix)
         out_decode_np = np.asarray(out_decode, dtype=np.float32)
-        if out_decode_np.ndim == 3:
-            out_decode_np = out_decode_np[0]
         return out_decode_np  # [1, D]
 
     @pytest.mark.parametrize("case_name", DECODE_CASES)
