@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
-    metadata_cls = KDAAttnBackendMetadata
     use_pallas_prefill = True
 
 
