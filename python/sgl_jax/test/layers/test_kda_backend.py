@@ -271,8 +271,8 @@ def _report_intermediates(case: dict, module, forward_batch, pool):
     q_conv, _ = KDAAttnBackend._extend_conv(q, q_w, q_state, cu_seqlens, conv_size, activation)
     k_conv, _ = KDAAttnBackend._extend_conv(k, k_w, k_state, cu_seqlens, conv_size, activation)
 
-    q_heads = module._split_heads(q_conv, module.num_k_heads, module.head_k_dim)
-    k_heads = module._split_heads(k_conv, module.num_k_heads, module.head_k_dim)
+    q_heads = q_conv.reshape(q_conv.shape[0], module.num_k_heads, module.k_head_dim)
+    k_heads = k_conv.reshape(k_conv.shape[0], module.num_k_heads, module.k_head_dim)
 
     for label, actual, key in [
         ("q_after_conv", q_heads, "intermediates__q_after_conv"),
