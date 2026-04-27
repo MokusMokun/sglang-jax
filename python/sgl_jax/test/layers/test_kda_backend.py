@@ -28,17 +28,22 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+    LinearRecurrentAttnBackendMetadata,
     MockRecurrentStatePool,
 )
-from sgl_jax.srt.layers.attention.linear.kda_backend import (
-    KDAAttnBackend,
-    KDAAttnBackendMetadata,
-)
+from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
 
-# LinearBase requires an ambient mesh context for PartitionSpec.
-_TEST_MESH = jax.sharding.Mesh(jax.devices()[:1], ("tensor",))
+# LinearBase requires an ambient mesh context for PartitionSpec. The KDA
+# model uses kernel_axes containing concrete axis names like "tensor", which
+# JAX rejects when those names live on Auto-typed axes; use Explicit so
+# PartitionSpec(...) can reference them.
+_TEST_MESH = jax.make_mesh(
+    (1,),
+    ("tensor",),
+    axis_types=(jax.sharding.AxisType.Explicit,),
+)
 jax.set_mesh(_TEST_MESH)
 
 # ---------------------------------------------------------------------------
@@ -90,7 +95,7 @@ def _build_module(
     """Construct a KimiDeltaAttention and load GPU reference weights."""
     weights = dict(np.load(weights_path, allow_pickle=True))
     config = _make_config(weights)
-    module = KimiDeltaAttention(config, layer_idx=0, dtype=dtype)
+    module = KimiDeltaAttention(config, layer_idx=0, mesh=_TEST_MESH, dtype=dtype)
 
     num_heads = config.linear_attn_config["num_heads"]
 
@@ -113,12 +118,13 @@ def _build_module(
             w = w.T
         _set_param(module, attr, w)
 
-    # Conv weights: GPU dumps are [channels, (1,) kernel], LinearBase is [kernel, channels].
+    # Conv weights: GPU dumps are [D, (1,) K]; we store [D, K] directly so
+    # only a squeeze is needed (no transpose).
     for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
         w = weights[f"weights__{name}.weight"]
         if w.ndim == 3 and w.shape[1] == 1:
             w = w[:, 0, :]
-        _set_param(module, f"{name}.weight", w.T)
+        _set_param(module, f"{name}.weight", w)
 
     a_log = weights["weights__A_log"]
     _set_param(module, "A_log", a_log.reshape(1, 1, num_heads, 1))
@@ -140,8 +146,8 @@ def _build_extend_env(
     N = cu_seqlens.shape[0] - 1
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
 
-    backend = KDAAttnBackend(mesh=None)
-    backend.forward_metadata = KDAAttnBackendMetadata(
+    backend = KDAAttnBackend(mesh=_TEST_MESH)
+    backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
         cu_q_lens=cu_seqlens,
         recurrent_indices=jnp.arange(N, dtype=jnp.int32),
     )
@@ -158,8 +164,22 @@ def _build_extend_env(
     )
     if init_state is None:
         init_state = jnp.zeros((N, H, K, V), dtype=jnp.float32)
+    # Conv cache: [B, 3, C, conv_size] where the 3 stream slots hold the q/k/v
+    # short-conv rolling buffers. KDA uses num_q_heads == num_k_heads ==
+    # num_v_heads with shared head_dim, so all three streams have width H * V.
+    # The channel axis must be sharded along "tensor" so concatenation with
+    # the LinearBase-projected q/k/v (which inherit (None, "tensor") from
+    # kernel_axes) lines up — otherwise XLA raises ShardingTypeError.
+    conv_size = module.conv_size
+    conv_sharding = jax.sharding.NamedSharding(
+        _TEST_MESH, jax.sharding.PartitionSpec(None, None, "tensor", None)
+    )
+    init_conv = jax.device_put(
+        jnp.zeros((N, 3, H * V, conv_size), dtype=jnp.float32),
+        conv_sharding,
+    )
     pool = MockRecurrentStatePool(
-        layer_caches={module.layer_idx: (init_state, None)},
+        layer_caches={module.layer_idx: (init_state, init_conv)},
     )
     return fb, pool
 
@@ -170,8 +190,8 @@ def _build_decode_env(
     B: int = 1,
 ) -> ForwardBatch:
     """Build DECODE ForwardBatch reusing an existing pool's state."""
-    backend = KDAAttnBackend(mesh=None)
-    backend.forward_metadata = KDAAttnBackendMetadata(
+    backend = KDAAttnBackend(mesh=_TEST_MESH)
+    backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
         cu_q_lens=jnp.array([0, B], dtype=jnp.int32),
         recurrent_indices=jnp.arange(B, dtype=jnp.int32),
     )
@@ -257,10 +277,16 @@ def _assert_two_tier(
 def _report_intermediates(case: dict, module, forward_batch, pool):
     """Print per-step max-abs-diff for debugging prefill divergence.
 
-    Conv and L2 norm now live in the backend; this helper runs the backend's
-    internal steps to extract intermediates.
+    Reconstructs q/k after the short conv by calling the same primitives the
+    backend uses (q_proj/k_proj on the module + short_convolution), which lets
+    us compare against the GPU intermediates without depending on backend
+    private helpers.
     """
     from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+    from sgl_jax.srt.layers.attention.linear.short_convolution import (
+        l2_normalize,
+        short_convolution,
+    )
 
     hidden = jnp.asarray(case["hidden_states"], dtype=jnp.float32)
     if hidden.ndim == 3:
@@ -268,27 +294,31 @@ def _report_intermediates(case: dict, module, forward_batch, pool):
 
     q, _ = module.q_proj(hidden)
     k, _ = module.k_proj(hidden)
-    v, _ = module.v_proj(hidden)
 
     backend = forward_batch.attn_backend
     recurrent_indices = backend.forward_metadata.recurrent_indices
-    _, conv_cache = backend._get_layer_cache(pool, module.layer_idx)
-    q_w, k_w, v_w = backend._get_conv_weights(module.attn)
-    conv_size = q_w.shape[-1]
-    q_state, k_state, v_state = backend._get_conv_states(
-        conv_cache,
-        recurrent_indices,
-        q.shape[-1],
-        conv_size,
-        q_w.dtype,
-    )
-    activation = module.attn.activation or jax.nn.silu
+    _, conv_buffers = backend.get_layer_cache(pool, module.layer_idx)
+    conv_states = conv_buffers[recurrent_indices]
+    q_state, k_state, _ = KDAAttnBackend._unpack_conv_states(conv_states)
+
+    q_w = module.q_conv1d.weight.value
+    k_w = module.k_conv1d.weight.value
+
     cu_seqlens = backend.forward_metadata.cu_q_lens
-    q_conv, _ = KDAAttnBackend._extend_conv(q, q_w, q_state, cu_seqlens, conv_size, activation)
-    k_conv, _ = KDAAttnBackend._extend_conv(k, k_w, k_state, cu_seqlens, conv_size, activation)
+    activation = module.attn.activation
+    q_conv, _ = short_convolution(
+        q, q_w, q_state, cu_seqlens, forward_batch.forward_mode, activation=activation
+    )
+    k_conv, _ = short_convolution(
+        k, k_w, k_state, cu_seqlens, forward_batch.forward_mode, activation=activation
+    )
 
     q_heads = q_conv.reshape(q_conv.shape[0], module.num_k_heads, module.k_head_dim)
     k_heads = k_conv.reshape(k_conv.shape[0], module.num_k_heads, module.k_head_dim)
+    # The backend l2-normalizes q/k before the recurrent kernel; mirror that
+    # so the reported diff matches the values fed into chunk_kda.
+    q_heads = l2_normalize(q_heads)
+    k_heads = l2_normalize(k_heads)
 
     for label, actual, key in [
         ("q_after_conv", q_heads, "intermediates__q_after_conv"),
@@ -348,7 +378,7 @@ class TestKDAPrefill:
         hidden = jnp.asarray(case["hidden_states"], dtype=jnp.float32)
         if hidden.ndim == 3:
             hidden = hidden[0]
-        output = module(hidden, None, forward_batch, pool)
+        output, _ = module(None, hidden, forward_batch, pool)
         output_np = np.asarray(output, dtype=np.float32)
 
         expected = case["out_fp32"]
@@ -421,7 +451,7 @@ class TestKDAPrefill:
         hidden = jnp.asarray(case["hidden_states"], dtype=jnp.bfloat16)
         if hidden.ndim == 3:
             hidden = hidden[0]
-        output = module_bf16(hidden, None, forward_batch, pool)
+        output, _ = module_bf16(None, hidden, forward_batch, pool)
         output_np = np.asarray(output, dtype=np.float32)
 
         expected = case["out_bf16"]
@@ -495,13 +525,21 @@ class TestKDADecode:
             jnp.asarray(case["initial_recurrent_state"], dtype=jnp.float32) if has_init else None
         )
 
-        # 1) Prefill T-1 tokens → state (recurrent + conv)
-        fb_prefix, pool_prefix = _build_extend_env(module, T - 1, init_state)
-        _ = module(hidden[: T - 1], None, fb_prefix, pool_prefix)
+        # 1) Prefill T-1 tokens. The backend returns ``(out, (new_ssm,
+        # new_conv))`` but does NOT write the new state back to the pool —
+        # that's the upper layer's job in production (KimiDecoderLayer /
+        # ModelRunner with the real RecurrentStatePool). Mirror it here so
+        # decode reads the post-prefill cache instead of the init zeros;
+        # otherwise the decode call would degenerate into a "fresh T=1
+        # decode" and never match the GPU reference's T-th step.
+        fb_prefix, pool = _build_extend_env(module, T - 1, init_state)
+        _, (new_ssm, new_conv) = module(None, hidden[: T - 1], fb_prefix, pool)
+        indices = jnp.arange(1, dtype=jnp.int32)  # single-seq prefill
+        pool.set_linear_recurrent_layer_cache(module.layer_idx, indices, new_ssm, new_conv)
 
         # 2) Decode the T-th token using the state from step 1
-        fb_decode = _build_decode_env(module, pool_prefix, B=1)
-        out_decode = module(hidden[T - 1 : T], None, fb_decode, pool_prefix)
+        fb_decode = _build_decode_env(module, pool, B=1)
+        out_decode, _ = module(None, hidden[T - 1 : T], fb_decode, pool)
         out_decode_np = np.asarray(out_decode, dtype=np.float32)
         return out_decode_np  # [1, D]
 
