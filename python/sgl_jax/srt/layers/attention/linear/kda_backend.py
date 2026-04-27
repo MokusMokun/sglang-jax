@@ -19,7 +19,9 @@ if TYPE_CHECKING:
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
-    use_pallas_prefill = False
+    metadata_cls = KDAAttnBackendMetadata
+    use_pallas_prefill = True
+
 
     def __init__(self, runner):
         super().__init__(
@@ -96,9 +98,19 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
     ) -> tuple[jax.Array, jax.Array]:
         if self.use_pallas_prefill:
-            return self._forward_extend_pallas(
-                q, k, v, g, beta, initial_state, cu_seqlens, layer
-            )
+            # Use shape-based (compile-time) check to decide kernel.
+            # When total packed tokens <= chunk_size and there are multiple
+            # sequences, every sequence must be shorter than chunk_size.
+            # The chunk kernel pads each short sequence to chunk_size, losing
+            # precision in the inter-chunk (initial-state) contribution due
+            # to exp2(g_cumsum) underflow.  Fall back to naive in that case.
+            BT = 64
+            T = q.shape[0]
+            N = cu_seqlens.shape[0] - 1
+            if T > BT or N <= 1:
+                return self._forward_extend_pallas(
+                    q, k, v, g, beta, initial_state, cu_seqlens, layer
+                )
         return self._forward_extend_naive(
             q, k, v, g, beta, initial_state, cu_seqlens, layer
         )
