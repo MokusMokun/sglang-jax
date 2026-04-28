@@ -1,6 +1,7 @@
 """Minimal matmul error reproduction: L22 q_proj on TPU vs GPU dump.
 
 One matmul: hidden_states @ q_proj_w → compare against GPU intermediates__q_proj.
+Tests three TPU precision levels via jax.lax.dot.
 
 Usage:
     python test_matmul_error_minimal.py                # fp32
@@ -9,11 +10,18 @@ Usage:
 
 import os
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 DUMP = os.environ.get("KDA_DUMP_DIR", "/models/yuhao/kimi-linear/kda_module")
 LAYER = "L22"
 CASE = "single_T128"
+
+PRECISIONS = [
+    ("DEFAULT", jax.lax.Precision.DEFAULT),
+    ("HIGH", jax.lax.Precision.HIGH),
+    ("HIGHEST", jax.lax.Precision.HIGHEST),
+]
 
 
 def dist(name: str, arr: np.ndarray):
@@ -23,6 +31,16 @@ def dist(name: str, arr: np.ndarray):
     print(f"  {name:>12s}  shape={str(arr.shape):<16s}  "
           f"mean={a.mean():+.4e}  std={a.std():.4e}  "
           f"|abs| p50={pcts[0]:.4e} p90={pcts[1]:.4e} p99={pcts[2]:.4e} max={pcts[3]:.4e}")
+
+
+def error_stats(out: np.ndarray, ref: np.ndarray) -> dict:
+    diff = np.abs(out - ref)
+    return {
+        "max_abs": float(diff.max()),
+        "mean_abs": float(diff.mean()),
+        "p50": float(np.percentile(diff, 50)),
+        "p99": float(np.percentile(diff, 99)),
+    }
 
 
 def main():
@@ -53,21 +71,19 @@ def main():
     dist("W (weight)", np.asarray(W))
     dist("ref (GPU)", ref)
 
-    # One matmul
-    out = x @ W  # [128, 4096]
-    out_f32 = np.asarray(out, dtype=np.float32)
-
-    dist("out (TPU)", out_f32)
-
-    # --- Error distribution ---
-    diff = np.abs(out_f32 - ref)
-    rel = diff / (np.abs(ref) + 1e-8)
-
+    # --- Compare three precision levels ---
     print(f"\n{'=' * 78}")
-    print(f"  Error analysis")
+    print(f"  Precision comparison ({args.dtype})")
     print(f"{'=' * 78}")
-    dist("abs_error", diff)
-    dist("rel_error", rel)
+    print(f"  {'Precision':<10s}  {'max_abs':>10s}  {'mean_abs':>10s}  {'p50':>10s}  {'p99':>10s}")
+    print(f"  {'-' * 10}  {'-' * 10}  {'-' * 10}  {'-' * 10}  {'-' * 10}")
+
+    for name, prec in PRECISIONS:
+        out = jax.lax.dot(x, W, precision=prec)
+        out_f32 = np.asarray(out, dtype=np.float32)
+        s = error_stats(out_f32, ref)
+        print(f"  {name:<10s}  {s['max_abs']:>10.4e}  {s['mean_abs']:>10.4e}  "
+              f"{s['p50']:>10.4e}  {s['p99']:>10.4e}")
 
 
 if __name__ == "__main__":

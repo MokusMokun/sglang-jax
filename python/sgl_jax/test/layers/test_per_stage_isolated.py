@@ -18,9 +18,10 @@ Stages:
  10. Final output              GPU o_norm → JAX o_proj → vs out_fp32
 
 Usage:
-    python test_per_stage_isolated.py                           # L0, single_T128, fp32
-    python test_per_stage_isolated.py --layer L22 --dtype bf16  # worst-case layer, bf16
-    python test_per_stage_isolated.py --all-cases               # sweep all cases
+    python test_per_stage_isolated.py                                      # L0, single_T128, fp32, default
+    python test_per_stage_isolated.py --layer L22 --dtype bf16             # worst-case layer, bf16
+    python test_per_stage_isolated.py --layer L22 --precision high         # HIGH precision matmul
+    python test_per_stage_isolated.py --all-cases                          # sweep all cases
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import os
 import sys
 
 import jax
+import jax.lax
 import jax.numpy as jnp
 import numpy as np
 
@@ -150,7 +152,7 @@ def stage(label, actual, case, key):
 # Isolated pipeline
 # ---------------------------------------------------------------------------
 
-def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
+def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype, precision):
     T = int(case["T"])
     H, D, K = ws["num_heads"], ws["head_dim"], ws["conv_size"]
     proj = ws["proj_size"]
@@ -169,12 +171,15 @@ def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
     def w(name):
         return jnp.asarray(ws[name], dtype=dtype)
 
+    def matmul(a, b):
+        return jax.lax.dot(a, b, precision=precision)
+
     rows = []
 
     # === Stage 1: Projections (input: hidden_states — same for both) ===
-    rows.append(stage("1. Q projection", hidden @ w("q_proj_w"), case, "intermediates__q_proj"))
-    rows.append(stage("1. K projection", hidden @ w("k_proj_w"), case, "intermediates__k_proj"))
-    rows.append(stage("1. V projection", hidden @ w("v_proj_w"), case, "intermediates__v_proj"))
+    rows.append(stage("1. Q projection", matmul(hidden, w("q_proj_w")), case, "intermediates__q_proj"))
+    rows.append(stage("1. K projection", matmul(hidden, w("k_proj_w")), case, "intermediates__k_proj"))
+    rows.append(stage("1. V projection", matmul(hidden, w("v_proj_w")), case, "intermediates__v_proj"))
 
     # === Stage 2: Conv+SiLU (input: GPU dump projection output) ===
     cache = jnp.zeros((N, proj, K), dtype=dtype)
@@ -222,7 +227,7 @@ def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
             })
 
     # === Stage 4: Gate (input: hidden_states — same for both) ===
-    raw_gate = (hidden @ w("f_a_proj_w")) @ w("f_b_proj_w")
+    raw_gate = matmul(matmul(hidden, w("f_a_proj_w")), w("f_b_proj_w"))
     raw_gate = raw_gate.reshape(T, H, D)
 
     A_log = jnp.asarray(ws["A_log"], dtype=jnp.float32).reshape(H)
@@ -313,7 +318,7 @@ def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
         rows.append({"label": "6-7. KDA kernel (missing inputs)", "skip": True})
 
     # === Stage 8: Output gate (input: hidden_states — same for both) ===
-    g_out = ((hidden @ w("g_a_proj_w")) @ w("g_b_proj_w")).reshape(T, H, D)
+    g_out = matmul(matmul(hidden, w("g_a_proj_w")), w("g_b_proj_w")).reshape(T, H, D)
     rows.append(stage("8. Output gate (g_out)", g_out, case, "intermediates__g_out"))
 
     # === Stage 9: Output norm (input: GPU o_kda + GPU g_out) ===
@@ -343,13 +348,14 @@ def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
         gpu_o_norm = jnp.asarray(case["intermediates__o_norm"], dtype=dtype)
         if gpu_o_norm.ndim == 4:
             gpu_o_norm = gpu_o_norm[0]
-        final = gpu_o_norm.reshape(T, proj) @ w("o_proj_w")
+        final = matmul(gpu_o_norm.reshape(T, proj), w("o_proj_w"))
         rows.append(stage("10. Final output (o_proj)", final, case, "out_fp32"))
     else:
         rows.append({"label": "10. Final output", "skip": True})
 
     dtype_label = "fp32" if dtype == jnp.float32 else "bf16"
-    print_table(rows, f"{case_name} ({dtype_label}, T={T}, N={N}) [ISOLATED]")
+    prec_label = str(precision).split(".")[-1] if precision else "DEFAULT"
+    print_table(rows, f"{case_name} ({dtype_label}, T={T}, N={N}, precision={prec_label}) [ISOLATED]")
     return rows
 
 
@@ -362,6 +368,7 @@ def main():
     parser.add_argument("--layer", default="L0", help="Layer dir (default: L0)")
     parser.add_argument("--case", default="single_T128", help="Case name")
     parser.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"])
+    parser.add_argument("--precision", default="default", choices=["default", "high", "highest"])
     parser.add_argument("--all-cases", action="store_true", help="Sweep all 12 cases")
     args = parser.parse_args()
 
@@ -371,6 +378,12 @@ def main():
         sys.exit(1)
 
     dtype = jnp.float32 if args.dtype == "fp32" else jnp.bfloat16
+    precision_map = {
+        "default": jax.lax.Precision.DEFAULT,
+        "high": jax.lax.Precision.HIGH,
+        "highest": jax.lax.Precision.HIGHEST,
+    }
+    precision = precision_map[args.precision]
 
     print(f"Loading weights from {layer_dir}/weights.npz ...")
     ws = load_weights(layer_dir)
@@ -384,7 +397,7 @@ def main():
         except FileNotFoundError as e:
             print(f"\n  {cn}: {e} — skipped")
             continue
-        run_one_case(ws, case, cn, dtype)
+        run_one_case(ws, case, cn, dtype, precision)
 
 
 if __name__ == "__main__":

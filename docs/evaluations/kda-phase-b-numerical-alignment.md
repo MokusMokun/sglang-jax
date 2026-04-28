@@ -15,6 +15,10 @@
 
 **Test matrix**: 12 prefill cases × 2 dtypes + 3 decode cases × 2 dtypes = 30 tests/layer, 120 total across 4 layers. All single_T1 cases skipped (GPU chunk kernel outputs zero for T < 64).
 
+**Precision context**: Production runs in **bf16**. FP32 tests verify logic/pipeline correctness; bf16 results represent production-level precision.
+
+**Metrics**: `max_abs = max(|TPU - GPU|)`, `mean_abs = mean(|TPU - GPU|)`, computed elementwise over the full output tensor. Pass/fail uses `np.testing.assert_allclose(atol, rtol)` where `|TPU - GPU| ≤ atol + rtol × |GPU|`.
+
 **Tolerance tiers** (tight first, loose as fallback):
 
 | | Tight | Loose |
@@ -27,6 +31,8 @@
 ---
 
 ## Results Summary
+
+Matmul of all results below use `Precision.DEFAULT` (single-pass bf16 matmul on TPU MXU).
 
 ### Cross-Layer (Prefill)
 
@@ -66,24 +72,27 @@ Error grows ~20x L0→L22 (prefill), ~4x (decode) — deeper layers have larger 
 
 Each stage receives the **GPU dump intermediate** as input, isolating that stage's own JAX-vs-GPU error from upstream accumulation.
 
-**L22, single_T128, FP32:**
+**L22, single_T128, FP32**
+> Note: 
+> `max_abs/mean_abs` columns use `Precision.DEFAULT`; 
+> `HIGH` columns use `Precision.HIGH` — 3-pass bf16 matmul, see [Minimal Reproduction](#minimal-reproduction)
 
-| Stage | Input source | max_abs | mean_abs |
-|-------|-------------|---------|----------|
-| Q projection | hidden_states | <u>2.73e-02</u> | <u>2.60e-03</u> |
-| K projection | hidden_states | <u>2.61e-02</u> | <u>2.49e-03</u> |
-| V projection | hidden_states | <u>2.23e-02</u> | <u>3.03e-03</u> |
-| Q conv+SiLU | GPU q_proj | 1.91e-06 | 5.38e-09 |
-| K conv+SiLU | GPU k_proj | 3.81e-06 | 7.29e-09 |
-| V conv+SiLU | GPU v_proj | 1.43e-06 | 1.58e-08 |
-| Gate (fused_kda_gate) | hidden_states | **1.65e+00** | **5.61e-03** |
-| Beta (sigmoid) | hidden_states | 2.84e-03 | 3.64e-04 |
-| KDA output (chunk) | GPU post-conv + g + beta | 1.61e-04 | 1.81e-06 |
-| KDA output (fused_rec) | GPU post-conv + g + beta | 1.19e-07 | 9.50e-10 |
-| Recurrent state (fused) | GPU post-conv + g + beta | 8.34e-07 | 5.96e-09 |
-| Output gate (g_out) | hidden_states | <u>3.46e-02</u> | <u>2.42e-03</u> |
-| Output norm | GPU o_kda + GPU g_out | 7.15e-07 | 5.31e-09 |
-| Final output (o_proj) | GPU o_norm | 1.14e-02 | 8.55e-04 |
+| Stage | Input source | max_abs | mean_abs | HIGH max_abs | HIGH mean_abs |
+|-------|-------------|---------|----------|-------------|--------------|
+| Q projection | hidden_states | <u>2.73e-02</u> | <u>2.60e-03</u> | 8.44e-05 | 7.73e-06 |
+| K projection | hidden_states | <u>2.61e-02</u> | <u>2.49e-03</u> | 7.78e-05 | 7.41e-06 |
+| V projection | hidden_states | <u>2.23e-02</u> | <u>3.03e-03</u> | 6.72e-05 | 9.00e-06 |
+| Q conv+SiLU | GPU q_proj | 1.91e-06 | 5.38e-09 | — | — |
+| K conv+SiLU | GPU k_proj | 3.81e-06 | 7.29e-09 | — | — |
+| V conv+SiLU | GPU v_proj | 1.43e-06 | 1.58e-08 | — | — |
+| Gate (fused_kda_gate) | hidden_states | **1.65e+00** | **5.61e-03** | 2.90e-03 | 1.74e-05 |
+| Beta (sigmoid) | hidden_states | 2.84e-03 | 3.64e-04 | — | — |
+| KDA output (chunk) | GPU post-conv + g + beta | 1.61e-04 | 1.81e-06 | — | — |
+| KDA output (fused_rec) | GPU post-conv + g + beta | 1.19e-07 | 9.50e-10 | — | — |
+| Recurrent state (fused) | GPU post-conv + g + beta | 8.34e-07 | 5.96e-09 | — | — |
+| Output gate (g_out) | hidden_states | <u>3.46e-02</u> | <u>2.42e-03</u> | 9.97e-05 | 7.11e-06 |
+| Output norm | GPU o_kda + GPU g_out | 7.15e-07 | 5.31e-09 | — | — |
+| Final output (o_proj) | GPU o_norm | 1.14e-02 | 8.55e-04 | 2.19e-05 | 2.52e-06 |
 
 **L22, single_T128, BF16:**
 
@@ -110,17 +119,17 @@ BF16 conv error (~8e-2) is larger because GPU dump intermediates are fp32 while 
 
 | Path | Stage | Isolated error | Source |
 |------|-------|---------------|--------|
-| hidden → q/k/v | projection matmul | <u>~2e-2</u> | cross-device accumulation |
+| hidden → q/k/v | projection matmul | <u>~2e-2</u> | `Precision.DEFAULT` bf16 truncation |
 | q/k/v → heads | conv+SiLU (K=4) | ~2e-6 | negligible |
 | heads → normed | L2 norm | — | elementwise |
-| hidden → raw_gate | gate projection (2 matmuls) | <u>~2e-2</u> | cross-device accumulation |
+| hidden → raw_gate | gate projection (2 matmuls) | <u>~2e-2</u> | `Precision.DEFAULT` bf16 truncation |
 | raw_gate → g | fused_kda_gate | **~2e+0** | exp(A_log) amplifies matmul error |
-| hidden → beta | sigmoid | ~3e-3 | cross-device accumulation |
+| hidden → beta | sigmoid | ~3e-3 | `Precision.DEFAULT` bf16 truncation |
 | normed+g+beta → o | fused_recurrent kernel | ~1e-7 | near bit-exact |
 | normed+g+beta → o | chunk/Pallas kernel | ~2e-4 | chunked accumulation |
-| hidden → g_out | output gate projection | <u>~3e-2</u> | cross-device accumulation |
+| hidden → g_out | output gate projection | <u>~3e-2</u> | `Precision.DEFAULT` bf16 truncation |
 | o+g_out → o_norm | GatedRMSNorm | ~7e-7 | elementwise |
-| o_norm → output | o_proj matmul | <u>~1e-2</u> | cross-device accumulation |
+| o_norm → output | o_proj matmul | <u>~1e-2</u> | `Precision.DEFAULT` bf16 truncation |
 
 ### Key Findings
 
@@ -128,20 +137,22 @@ BF16 conv error (~8e-2) is larger because GPU dump intermediates are fp32 while 
 
 2. **Gate max_abs (1.65e+00) is a scaling artifact.** Gate computes `-exp(A_log) * softplus(raw_gate + dt_bias)`. L22's A_log reaches 4.14, giving exp(A_log) = 62.7×. This amplifies the ~2e-2 matmul error: 62.7 × 2.6e-2 ≈ 1.63. Relative error is only ~0.2%.
 
-3. **Matmul error is inherent cross-device divergence** in accumulation order (GPU CUDA vs TPU XLA) and is not optimizable within the JAX implementation.
+3. **FP32 matmul error is caused by `Precision.DEFAULT`**, which truncates fp32 inputs to bf16 before multiplication on TPU MXU. `Precision.HIGH` (3-pass bf16) reduces error ~300× to ~8e-5, confirming the JAX implementation is logically correct. This does not affect bf16 production — bf16 inputs are already at native MXU precision, so `precision` has no effect.
 
 ### Minimal Reproduction
 
-Single matmul `hidden_states [128, 2304] @ q_proj_w [2304, 4096]` on L22, GPU dump vs TPU:
+Single matmul `hidden_states [128, 2304] @ q_proj_w [2304, 4096]` on L22, GPU dump vs TPU (`jax.lax.dot`):
 
-| | FP32 | BF16 |
-|---|---|---|
-| max_abs | 2.73e-02 | 3.80e-02 |
-| mean_abs | 2.60e-03 | 3.56e-03 |
-| \|abs\| p50 | 2.12e-03 | 2.79e-03 |
-| \|abs\| p99 | 9.27e-03 | 1.43e-02 |
+| Precision | FP32 max_abs | FP32 mean_abs | BF16 max_abs | BF16 mean_abs |
+|---|---|---|---|---|
+| DEFAULT (1-pass) | 2.73e-02 | 2.60e-03 | 3.80e-02 | 3.56e-03 |
+| HIGH (3-pass) | 8.44e-05 | 7.73e-06 | 3.80e-02 | 3.56e-03 |
+| HIGHEST (6-pass) | 8.58e-06 | 6.64e-07 | 3.80e-02 | 3.56e-03 |
 
-Input x ~ N(0, 1), weights std = 4.2e-2, output range ±15. Error median ~2e-3, 99th ~1e-2 — matching the isolated per-stage projection error. Script: `test/layers/test_matmul_error_minimal.py`.
+FP32 inputs: `HIGH` improves ~300×, `HIGHEST` ~3000× (near fp32 machine epsilon), confirming pipeline correctness. BF16 inputs: no change — `precision` only affects fp32→bf16 truncation in the multiplier; bf16 inputs are already at native MXU precision, so these results represent the production precision floor.
+
+Script: `test/layers/test_matmul_error_minimal.py`.
+Relavant Material: https://docs.jax.dev/en/latest/jax.lax.html#jax.lax.Precision
 
 ---
 
