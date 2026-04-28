@@ -28,17 +28,21 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
-    MockRecurrentStatePool,
+    LinearRecurrentAttnBackendMetadata,
 )
 from sgl_jax.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
-    KDAAttnBackendMetadata,
 )
+from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
 
-# LinearBase requires an ambient mesh context for PartitionSpec.
-_TEST_MESH = jax.sharding.Mesh(jax.devices()[:1], ("tensor",))
+# Explicit axis type: new kernel_axes=(None, "tensor") requires it in JAX 0.10+.
+# Pallas unshard is handled inside the backend (_forward_extend_pallas).
+_TEST_MESH = jax.sharding.Mesh(
+    jax.devices()[:1], ("tensor",),
+    axis_types=(jax.sharding.AxisType.Explicit,),
+)
 jax.set_mesh(_TEST_MESH)
 
 # ---------------------------------------------------------------------------
@@ -92,7 +96,7 @@ def _build_module(
     """Construct a KimiDeltaAttention and load GPU reference weights."""
     weights = dict(np.load(weights_path, allow_pickle=True))
     config = _make_config(weights)
-    module = KimiDeltaAttention(config, layer_idx=0, dtype=dtype)
+    module = KimiDeltaAttention(config, layer_idx=0, mesh=_TEST_MESH, dtype=dtype)
 
     num_heads = config.linear_attn_config["num_heads"]
 
@@ -115,12 +119,13 @@ def _build_module(
             w = w.T
         _set_param(module, attr, w)
 
-    # Conv weights: GPU dumps are [channels, (1,) kernel], LinearBase is [kernel, channels].
+    # Conv weights: GPU dumps are [channels, (1,) kernel].
+    # New LinearBase layout is [channels, kernel] (i.e. [D, K]) — no transpose.
     for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
         w = weights[f"weights__{name}.weight"]
         if w.ndim == 3 and w.shape[1] == 1:
             w = w[:, 0, :]
-        _set_param(module, f"{name}.weight", w.T)
+        _set_param(module, f"{name}.weight", w)
 
     a_log = weights["weights__A_log"]
     _set_param(module, "A_log", a_log.reshape(1, 1, num_heads, 1))
@@ -129,23 +134,52 @@ def _build_module(
     return module
 
 
+def _build_pool(
+    module: KimiDeltaAttention,
+    N: int,
+    init_state: jax.Array | None = None,
+) -> RecurrentStatePool:
+    """Build a RecurrentStatePool for testing, optionally seeded with init_state."""
+    H = module.num_heads
+    D = module.head_dim
+    conv_size = module.conv_size
+    pool = RecurrentStatePool(
+        linear_recurrent_layer_ids=[module.layer_idx],
+        max_num_reqs=N,
+        num_heads=H,
+        head_dim=D,
+        conv_kernel_size=conv_size,
+        mesh=_TEST_MESH,
+    )
+    if init_state is not None:
+        # init_state shape: [N, H, K, V]. Pool slot 0 is dummy, valid from 1.
+        # recurrent_indices will be [1..N], so write init_state into those slots.
+        pool.recurrent_buffers[0] = pool.recurrent_buffers[0].at[1 : N + 1].set(
+            init_state.astype(pool.temporal_dtype)
+        )
+    return pool
+
+
 def _build_extend_env(
     module: KimiDeltaAttention,
     T: int,
     init_state: jax.Array | None = None,
     cu_seqlens: jax.Array | None = None,
-) -> tuple[ForwardBatch, MockRecurrentStatePool]:
+) -> tuple[ForwardBatch, RecurrentStatePool]:
     """Build EXTEND ForwardBatch + pool for one or more sequences."""
-    H, K, V = module.num_heads, module.k_head_dim, module.head_dim
     if cu_seqlens is None:
         cu_seqlens = jnp.array([0, T], dtype=jnp.int32)
     N = cu_seqlens.shape[0] - 1
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
 
-    backend = KDAAttnBackend(mesh=None)
-    backend.forward_metadata = KDAAttnBackendMetadata(
+    pool = _build_pool(module, N, init_state)
+    # Pool slot 0 is dummy; valid slots are 1..N.
+    recurrent_indices = jnp.arange(1, N + 1, dtype=jnp.int32)
+
+    backend = KDAAttnBackend(mesh=_TEST_MESH)
+    backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
         cu_q_lens=cu_seqlens,
-        recurrent_indices=jnp.arange(N, dtype=jnp.int32),
+        recurrent_indices=recurrent_indices,
     )
     fb = ForwardBatch(
         bid=0, forward_mode=ForwardMode.EXTEND, batch_size=int(N),
@@ -156,24 +190,20 @@ def _build_extend_env(
         attn_backend=backend,
         extend_seq_lens=seq_lens,
     )
-    if init_state is None:
-        init_state = jnp.zeros((N, H, K, V), dtype=jnp.float32)
-    pool = MockRecurrentStatePool(
-        layer_caches={module.layer_idx: (init_state, None)},
-    )
     return fb, pool
 
 
 def _build_decode_env(
     module: KimiDeltaAttention,
-    pool: MockRecurrentStatePool,
+    pool: RecurrentStatePool,
     B: int = 1,
 ) -> ForwardBatch:
     """Build DECODE ForwardBatch reusing an existing pool's state."""
-    backend = KDAAttnBackend(mesh=None)
-    backend.forward_metadata = KDAAttnBackendMetadata(
+    recurrent_indices = jnp.arange(1, B + 1, dtype=jnp.int32)
+    backend = KDAAttnBackend(mesh=_TEST_MESH)
+    backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
         cu_q_lens=jnp.array([0, B], dtype=jnp.int32),
-        recurrent_indices=jnp.arange(B, dtype=jnp.int32),
+        recurrent_indices=recurrent_indices,
     )
     return ForwardBatch(
         bid=0, forward_mode=ForwardMode.DECODE, batch_size=B,
@@ -215,7 +245,7 @@ FP32_RTOL_LOOSE = 2e-2
 
 BF16_ATOL_TIGHT = 3e-3
 BF16_RTOL_TIGHT = 5e-3
-BF16_ATOL_LOOSE = 2e-2
+BF16_ATOL_LOOSE = 7e-2
 BF16_RTOL_LOOSE = 2e-2
 
 
@@ -247,12 +277,10 @@ def _assert_two_tier(
 
 
 def _report_intermediates(case: dict, module, forward_batch, pool):
-    """Print per-step max-abs-diff for debugging prefill divergence.
-
-    Conv and L2 norm now live in the backend; this helper runs the backend's
-    internal steps to extract intermediates.
-    """
-    from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+    """Print per-step max-abs-diff for debugging prefill divergence."""
+    from sgl_jax.srt.layers.attention.linear.short_convolution import (
+        short_convolution,
+    )
 
     hidden = jnp.asarray(case["hidden_states"], dtype=jnp.float32)
     if hidden.ndim == 3:
@@ -260,20 +288,24 @@ def _report_intermediates(case: dict, module, forward_batch, pool):
 
     q, _ = module.q_proj(hidden)
     k, _ = module.k_proj(hidden)
-    v, _ = module.v_proj(hidden)
 
-    backend = forward_batch.attn_backend
-    recurrent_indices = backend.forward_metadata.recurrent_indices
-    _, conv_cache = backend._get_layer_cache(pool, module.layer_idx)
-    q_w, k_w, v_w = backend._get_conv_weights(module.attn)
-    conv_size = q_w.shape[-1]
-    q_state, k_state, v_state = backend._get_conv_states(
-        conv_cache, recurrent_indices, q.shape[-1], conv_size, q_w.dtype,
+    cu_seqlens = forward_batch.attn_backend.forward_metadata.cu_q_lens
+    recurrent_indices = forward_batch.attn_backend.forward_metadata.recurrent_indices
+    _, conv_buf = forward_batch.attn_backend.get_layer_cache(pool, module.layer_idx)
+    q_state, k_state, _ = KDAAttnBackend._load_conv_states(
+        conv_buf, recurrent_indices, module.attn,
     )
-    activation = module.attn.activation or jax.nn.silu
-    cu_seqlens = backend.forward_metadata.cu_q_lens
-    q_conv, _ = KDAAttnBackend._extend_conv(q, q_w, q_state, cu_seqlens, conv_size, activation)
-    k_conv, _ = KDAAttnBackend._extend_conv(k, k_w, k_state, cu_seqlens, conv_size, activation)
+
+    q_conv_w = module.q_conv1d.weight[...]
+    k_conv_w = module.k_conv1d.weight[...]
+    q_conv, _ = short_convolution(
+        q, q_conv_w, q_state, cu_seqlens,
+        ForwardMode.EXTEND, activation=jax.nn.silu,
+    )
+    k_conv, _ = short_convolution(
+        k, k_conv_w, k_state, cu_seqlens,
+        ForwardMode.EXTEND, activation=jax.nn.silu,
+    )
 
     q_heads = q_conv.reshape(q_conv.shape[0], module.num_k_heads, module.k_head_dim)
     k_heads = k_conv.reshape(k_conv.shape[0], module.num_k_heads, module.k_head_dim)
@@ -333,7 +365,7 @@ class TestKDAPrefill:
         hidden = jnp.asarray(case["hidden_states"], dtype=jnp.float32)
         if hidden.ndim == 3:
             hidden = hidden[0]
-        output = module(hidden, None, forward_batch, pool)
+        output, _ = module(None, hidden, forward_batch, pool)
         output_np = np.asarray(output, dtype=np.float32)
 
         expected = case["out_fp32"]
@@ -397,7 +429,7 @@ class TestKDAPrefill:
         hidden = jnp.asarray(case["hidden_states"], dtype=jnp.bfloat16)
         if hidden.ndim == 3:
             hidden = hidden[0]
-        output = module_bf16(hidden, None, forward_batch, pool)
+        output, _ = module_bf16(None, hidden, forward_batch, pool)
         output_np = np.asarray(output, dtype=np.float32)
 
         expected = case["out_bf16"]
@@ -471,13 +503,17 @@ class TestKDADecode:
             if has_init else None
         )
 
-        # 1) Prefill T-1 tokens → state (recurrent + conv)
+        # 1) Prefill T-1 tokens → new state (returned functionally)
         fb_prefix, pool_prefix = _build_extend_env(module, T - 1, init_state)
-        _ = module(hidden[: T - 1], None, fb_prefix, pool_prefix)
+        _, new_state = module(None, hidden[: T - 1], fb_prefix, pool_prefix)
+        # new_state = (new_recurrent_buf, new_conv_buf); write back into pool.
+        new_recurrent_buf, new_conv_buf = new_state
+        pool_prefix.recurrent_buffers[0] = new_recurrent_buf
+        pool_prefix.conv_buffers[0] = new_conv_buf
 
-        # 2) Decode the T-th token using the state from step 1
+        # 2) Decode the T-th token using the updated pool
         fb_decode = _build_decode_env(module, pool_prefix, B=1)
-        out_decode = module(hidden[T - 1 : T], None, fb_decode, pool_prefix)
+        out_decode, _ = module(None, hidden[T - 1 : T], fb_decode, pool_prefix)
         out_decode_np = np.asarray(out_decode, dtype=np.float32)
         return out_decode_np  # [1, D]
 

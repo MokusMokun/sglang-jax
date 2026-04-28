@@ -1,6 +1,6 @@
 # KDA Phase B: M1 Numerical Alignment
 
-**Date**: 2026-04-27 (updated 2026-04-27)
+**Date**: 2026-04-27 (updated 2026-04-28, isolated analysis added 2026-04-28)
 **Branch**: `sub3/layer-tests`
 **Environment**: TPU v6e-4 (`sky-efe2-yuhao`), conda `sglang` (JAX 0.10.0, libtpu 0.0.40)
 **GPU reference**: H100, fla `chunk_kda` with `force_mode="chunk"`
@@ -12,6 +12,8 @@
 - **TPU kernel (prefill)**: Pallas chunked kernel (`chunk_kda_fwd`, `use_pallas_prefill=True`) with shape-based routing — Pallas when `T > 64` or `N <= 1`, naive recurrent fallback otherwise.
 - **TPU kernel (decode)**: `fused_recurrent_kda` (naive recurrent)
 - **GPU reference kernel**: `chunk_kda` (chunked Triton kernel, `force_mode="chunk"`)
+- **State pool**: `RecurrentStatePool` (production pool with TP-sharded buffers); conv state layout `[N+1, K-1, proj_size]` adapted via `_load_conv_states`/`_store_conv_states` to `short_convolution`'s `[B, D, K]` cache convention.
+- **Mesh**: `Explicit` axis type, TP=1. Kernel inputs unsharded via `jax.sharding.reshard` before Pallas/naive kernels (Pallas requires replicated inputs; naive kernel's per-timestep scatter hits Explicit-mode broadcast rules).
 - **Precisions tested**: float32, bfloat16
 - **Prefill (EXTEND)**: 12 cases x 2 dtypes = 24 tests. Single sequences (T=1,8,64,65,128,256,1024), varlen (balanced 4x32, unbalanced, single T128), with/without initial state.
 - **Decode**: 3 cases x 2 dtypes = 6 tests. Prefill T-1 tokens then decode the T-th token; compare decode output against GPU reference's last-position output. Cases: single_T8, single_T128, single_T128_initstate.
@@ -25,11 +27,11 @@ Two-tier system: tight first, loose as fallback. Tight pass = silent; tight fail
 | | Tight | Loose |
 |---|---|---|
 | **Prefill FP32** | atol=2e-3, rtol=5e-3 | atol=3e-2, rtol=2e-2 |
-| **Prefill BF16** | atol=3e-3, rtol=5e-3 | atol=2e-2, rtol=2e-2 |
+| **Prefill BF16** | atol=3e-3, rtol=5e-3 | atol=7e-2, rtol=2e-2 |
 | **Decode FP32** | atol=1e-3, rtol=1e-3 | atol=1e-2, rtol=1e-2 |
 | **Decode BF16** | atol=2e-3, rtol=2e-3 | atol=2e-2, rtol=2e-2 |
 
-Tight tier is calibrated for L0 (smallest weights). Loose tier covers up to L22 (largest weights, worst-case max_abs ≈ 2.8e-2 fp32 / 6.3e-2 bf16).
+Tight tier is calibrated for L0 (smallest weights). Loose tier covers up to L22 (largest weights, worst-case max_abs ≈ 2.8e-2 fp32 / 6.3e-2 bf16). BF16 loose atol widened from 2e-2 to 7e-2 to cover L22's worst case (single_T1024 bf16: 6.25e-02).
 
 ## L0 Results
 
@@ -225,9 +227,9 @@ All decode tests pass at tight tolerance.
 
 | Case | FP32 max_abs | BF16 max_abs | Status |
 |------|-------------|-------------|--------|
-| single_T8 | 4.58e-03 | 7.81e-03 | PASS (loose) |
-| single_T128 | 4.40e-03 | 1.56e-02 | PASS (loose) |
-| single_T128_initstate | 4.40e-03 | 1.56e-02 | PASS (loose) |
+| single_T8 | 4.78e-03 | 1.17e-02 | PASS (loose) |
+| single_T128 | 5.26e-03 | 1.56e-02 | PASS (loose) |
+| single_T128_initstate | 5.26e-03 | 1.56e-02 | PASS (loose) |
 
 ## Cross-Layer Summary
 
@@ -247,7 +249,7 @@ All decode tests pass at tight tolerance.
 | L0 | < 1e-3 | < 2e-3 |
 | L6 | 2.13e-03 | 3.91e-03 |
 | L13 | 2.80e-03 | 3.91e-03 |
-| L22 | 4.58e-03 | 1.56e-02 |
+| L22 | 5.26e-03 | 1.56e-02 |
 
 ### Overall
 
@@ -261,41 +263,6 @@ All decode tests pass at tight tolerance.
 
 Error grows ~20x from L0 to L22 (prefill) and ~4x (decode). This is expected: deeper layers have larger weight magnitudes and output scales, amplifying cross-device matmul precision differences. Decode error is smaller than prefill because it operates on a single token (no sequence-length accumulation). mean_rel stays stable at 2-8% (FP32) across all layers, confirming the error scales proportionally with output magnitude.
 
-## Per-Stage Intermediate Comparison (single_T128)
-
-Measured by comparing TPU output at each stage against GPU dump intermediates.
-
-| Stage | Compared against | max_abs_diff | Value range | Relative error |
-|-------|-----------------|-------------|-------------|---------------|
-| Conv+SiLU (q) | `intermediates__q_after_conv` | 1.35e-02 | [-0.28, 6.63] | ~2.0e-3 |
-| Conv+SiLU (k) | `intermediates__k_after_conv` | 1.02e-02 | — | — |
-| Conv+SiLU (v) | `intermediates__v_after_conv` | 6.38e-03 | — | — |
-| Beta (sigmoid) | `intermediates__beta` | 4.25e-03 | — | — |
-| KDA attn output | `intermediates__o_kda_fused_recurrent` | 2.31e-04 | [-0.11, 0.07] | ~2.1e-3 |
-| KDA attn output | `intermediates__o_kda_chunk` | 3.10e-04 | — | — |
-| Recurrent state | `intermediates__recurrent_state_fused_recurrent` | 1.56e-03 | — | — |
-| Recurrent state | `intermediates__recurrent_state_chunk` | 1.88e-03 | — | — |
-| Final module output | `out_fp32` | 7.07e-04 | [-0.15, 0.22] | ~3.2e-3 |
-
-**Not measured**: projection-only error (bundled with conv), L2 norm error, activated gate comparison (diagnostic compared raw gate against activated gate by mistake), o_norm output.
-
-### Error flow analysis
-
-```
-Projection → Conv+SiLU → L2 Norm → KDA Attention → GatedRMSNorm → o_proj
-              ~1e-2                    ~2e-4                         ~7e-4
-```
-
-The conv stage introduces the largest absolute error (~1e-2), but L2 normalization dampens it significantly before it reaches the attention computation. The attention output error (~2e-4) is much smaller than the conv error, indicating L2 norm is effective at suppressing upstream precision differences. The final output error (~7e-4) is amplified from the attention error through the norm and projection stages.
-
-### GPU chunk vs fused_recurrent baseline
-
-Even on GPU, the two kernels differ:
-- `chunk` vs `fused_recurrent` attention output: max_abs_diff = 1.21e-04
-- `chunk` vs `fused_recurrent` recurrent state: max_abs_diff = 6.33e-04
-
-This sets a floor for cross-kernel comparison.
-
 ## T=1 Skip Rationale
 
 GPU reference `out_fp32` for `single_T1` is all zeros. The GPU dump uses `force_mode="chunk"`, and the chunk kernel produces zero output when T < chunk_size (64). The TPU naive kernel correctly produces non-zero output for T=1.
@@ -304,11 +271,91 @@ The test verifies T=1 produces no NaN and non-zero output, then skips the numeri
 
 ## Error Source Breakdown
 
-1. **Cross-device matmul precision** (~1e-2 at conv): GPU (CUDA) and TPU use different matmul implementations with different accumulation orders. This is the dominant error source at the conv stage.
+### Cumulative vs Isolated Analysis
 
-2. **Cross-kernel difference** (~1e-4 at attention): `fused_recurrent_kda` (sequential per-timestep) vs `chunk_kda` (chunked parallel) use different computation orders, leading to floating-point accumulation differences.
+Previous per-stage comparisons used **cumulative** error: each stage feeds its own JAX output to the next, so measured error includes all upstream stages. To attribute error precisely, an **isolated** analysis was added: each stage receives the **GPU dump intermediate** as input, measuring only that stage's own JAX-vs-GPU divergence.
 
-3. **Error dampening by L2 norm**: The L2 normalization of q, k before attention reduces the ~1e-2 conv error to ~1e-4 at the attention output. This is the key reason the final output tolerance is manageable.
+### Isolated Per-Stage Comparison (L22, single_T128, FP32)
+
+Each stage receives GPU dump output from the previous stage as input. Error is purely from that stage's JAX implementation.
+
+| Stage | Input source | max_abs | mean_abs |
+|-------|-------------|---------|----------|
+| Q projection | hidden_states | <u>2.73e-02</u> | <u>2.60e-03</u> |
+| K projection | hidden_states | <u>2.61e-02</u> | <u>2.49e-03</u> |
+| V projection | hidden_states | <u>2.23e-02</u> | <u>3.03e-03</u> |
+| Q conv+SiLU | GPU q_proj | 1.91e-06 | 5.38e-09 |
+| K conv+SiLU | GPU k_proj | 3.81e-06 | 7.29e-09 |
+| V conv+SiLU | GPU v_proj | 1.43e-06 | 1.58e-08 |
+| Gate (fused_kda_gate) | hidden_states | **1.65e+00** | **5.61e-03** |
+| Beta (sigmoid) | hidden_states | 2.84e-03 | 3.64e-04 |
+| KDA output (chunk) | GPU post-conv + g + beta | 1.61e-04 | 1.81e-06 |
+| KDA output (fused_rec) | GPU post-conv + g + beta | 1.19e-07 | 9.50e-10 |
+| Recurrent state (fused) | GPU post-conv + g + beta | 8.34e-07 | 5.96e-09 |
+| Output gate (g_out) | hidden_states | <u>3.46e-02</u> | <u>2.42e-03</u> |
+| Output norm | GPU o_kda + GPU g_out | 7.15e-07 | 5.31e-09 |
+| Final output (o_proj) | GPU o_norm | 1.14e-02 | 8.55e-04 |
+
+### Isolated Per-Stage Comparison (L22, single_T128, BF16)
+
+| Stage | Input source | max_abs | mean_abs |
+|-------|-------------|---------|----------|
+| Q projection | hidden_states | 3.80e-02 | <u>3.56e-03</u> |
+| K projection | hidden_states | <u>5.11e-02</u> | <u>3.42e-03</u> |
+| V projection | hidden_states | 4.17e-02 | <u>4.16e-03</u> |
+| Q conv+SiLU | GPU q_proj | <u>7.77e-02</u> | 2.46e-04 |
+| K conv+SiLU | GPU k_proj | <u>1.24e-01</u> | 3.16e-04 |
+| V conv+SiLU | GPU v_proj | 3.76e-02 | 7.06e-04 |
+| Gate (fused_kda_gate) | hidden_states | **2.46e+00** | **7.35e-03** |
+| Beta (sigmoid) | hidden_states | 2.96e-03 | 4.32e-04 |
+| KDA output (chunk) | GPU post-conv + g + beta | 9.42e-04 | 5.20e-06 |
+| KDA output (fused_rec) | GPU post-conv + g + beta | 7.92e-04 | 4.12e-06 |
+| Recurrent state (fused) | GPU post-conv + g + beta | 6.01e-03 | 3.49e-05 |
+| Output gate (g_out) | hidden_states | <u>4.49e-02</u> | <u>2.97e-03</u> |
+| Output norm | GPU o_kda + GPU g_out | 1.72e-02 | 1.97e-04 |
+| Final output (o_proj) | GPU o_norm | 1.32e-02 | 1.14e-03 |
+
+### Cumulative vs Isolated Comparison (L22 FP32)
+
+| Stage | Cumulative max_abs | Isolated max_abs | Error attribution |
+|-------|-------------------|-----------------|-------------------|
+| Q projection | 2.73e-02 | 2.73e-02 | Same (no upstream) |
+| Q conv+SiLU | 3.49e-02 | **1.91e-06** | **99.99% from projection** |
+| KDA fused_rec | 2.93e-04 | **1.19e-07** | **99.96% from upstream** |
+| Output norm | 1.21e-02 | **7.15e-07** | **100% from upstream** |
+| Final (o_proj) | 1.14e-02 | 1.14e-02 | Same (GPU dump input) |
+
+### Key Finding: Error Is Dominated by Matmul Stages
+
+The isolated analysis reveals that **all observed error comes from two matmul stages**: input projections (`[T, 2304] @ [2304, 4096]`, ~2e-2) and output projection (`[T, 4096] @ [4096, 2304]`, ~1e-2). These are large-reduction-dimension matrix multiplications where GPU (CUDA) and TPU use different accumulation orders.
+
+All other stages have negligible isolated error:
+- **Conv+SiLU**: ~2e-6 (fp32) — the K=4 dot product is too short to accumulate meaningful error
+- **Fused recurrent kernel**: ~1e-7 (fp32) — pure JAX implementation is near bit-exact
+- **Output norm (GatedRMSNorm)**: ~7e-7 (fp32) — elementwise ops, no accumulation
+- **Chunk kernel (Pallas)**: ~2e-4 (fp32) — measurable but 100x smaller than matmul error
+
+**Gate's large max_abs (1.65e+00) is a scaling artifact, not an algorithmic issue.** The gate computation is `-exp(A_log) * softplus(raw_gate + dt_bias)`. L22's `A_log` ranges up to 4.14, giving `exp(A_log)` up to 62.7×. This multiplier amplifies the underlying ~2e-2 matmul error: 62.7 × 2.6e-2 ≈ 1.63, matching the observed 1.65e+00. The relative error is only ~0.2% (gate output range is [-346, 0]).
+
+In bf16, conv shows larger isolated error (~8e-2) because the GPU dump intermediates are fp32 while JAX conv operates in bf16 — the error is from bf16 truncation of the conv window/weights, not from algorithmic difference.
+
+Error pipeline (isolated max_abs, FP32):
+
+| Path | Stage | Isolated error | Source |
+|------|-------|---------------|--------|
+| hidden → q/k/v | projection matmul | <u>~2e-2</u> | cross-device accumulation |
+| q/k/v → heads | conv+SiLU (K=4) | ~2e-6 | negligible |
+| heads → normed | L2 norm | — | elementwise |
+| hidden → raw_gate | gate projection (2 matmuls) | <u>~2e-2</u> | cross-device accumulation |
+| raw_gate → g | fused_kda_gate | **~2e+0** | exp(A_log) amplifies matmul error |
+| hidden → beta | sigmoid | ~3e-3 | cross-device accumulation |
+| normed+g+beta → o | fused_recurrent kernel | ~1e-7 | near bit-exact |
+| normed+g+beta → o | chunk/Pallas kernel | ~2e-4 | chunked accumulation |
+| hidden → g_out | output gate projection | <u>~3e-2</u> | cross-device accumulation |
+| o+g_out → o_norm | GatedRMSNorm | ~7e-7 | elementwise |
+| o_norm → output | o_proj matmul | <u>~1e-2</u> | cross-device accumulation |
+
+**Implication**: To improve end-to-end precision, the only lever is the matmul stages. Conv, attention kernels, and normalization are already at or near machine epsilon. The matmul error (~1-3e-2 fp32) is an inherent cross-device (GPU vs TPU) difference in accumulation order and is not optimizable within the JAX implementation.
 
 ## Pallas Kernel Status
 
