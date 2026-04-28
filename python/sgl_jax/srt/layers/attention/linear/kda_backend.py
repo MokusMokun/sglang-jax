@@ -42,7 +42,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         **kwargs,
     ) -> jax.Array:
         recurrent_indices = self.forward_metadata.recurrent_indices
-        ssm_states, conv_states = self.get_state(
+        ssm_buffer, conv_buffer, ssm_states, conv_states = self.get_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices
         )
         q_state, k_state, v_state = self._unpack_conv_states(conv_states)
@@ -79,7 +79,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             forward_batch.forward_mode,
             activation=layer.activation,
         )
-        new_conv_states = jnp.stack([q_state_new, k_state_new, v_state_new], axis=1)
+        new_conv_states = jnp.concatenate([q_state_new, k_state_new, v_state_new], axis=1)
 
         q = q.reshape(q.shape[0], layer.num_q_heads, layer.head_q_dim)
         k = k.reshape(k.shape[0], layer.num_k_heads, layer.head_k_dim)
@@ -118,8 +118,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         else:
             raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
 
-        new_ssm_states = self.set_ssm_state(ssm_states, recurrent_indices, new_recurrent)
-        new_conv_states = self.set_conv_state(conv_states, recurrent_indices, new_conv_states)
+        new_ssm_states = self.set_ssm_state(ssm_buffer, recurrent_indices, new_recurrent)
+        new_conv_states = self.set_conv_state(conv_buffer, recurrent_indices, new_conv_states)
         return output.reshape(output.shape[0], -1), (new_ssm_states, new_conv_states)
 
     def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
@@ -127,7 +127,12 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             recurrent_state_pool,
             layer_id,
         )
-        return recurrent_buffers[recurrent_indices], conv_buffers[recurrent_indices]
+        return (
+            recurrent_buffers,
+            conv_buffers,
+            recurrent_buffers[recurrent_indices],
+            conv_buffers[recurrent_indices],
+        )
 
     def set_conv_state(self, conv_buffers, recurrent_indices, new_conv_states):
         return conv_buffers.at[recurrent_indices].set(new_conv_states)
@@ -310,17 +315,26 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
 
     @staticmethod
     def _unpack_conv_states(
-        conv_states,
+        conv_states: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Pull per-stream conv caches out of the pool layout.
 
-        Accepts either a ``(qs, ks, vs)`` tuple or a stacked ``[B, 3, C, K]``
-        array (the layout written back by ``__call__``).
+        Expects a ``[B, D, K-1]`` flat layout from ``RecurrentStatePool``,
+        where ``D = proj_q + proj_k + proj_v`` and channels are concatenated
+        in ``[Q | K | V]`` order. Currently assumes Q/K/V share head_dim and
+        head count, so ``D`` is split evenly into three. ``K`` here is
+        ``conv_kernel_size`` (the cache holds the prior ``K-1`` tokens).
+
+        Returns three per-stream caches shaped ``[B, D_stream, K-1]``, the
+        layout ``short_convolution`` consumes.
         """
-        if isinstance(conv_states, (tuple, list)) and len(conv_states) == 3:
-            return tuple(conv_states)
-        # Expect [B, 3, C, K] stacked layout.
-        return conv_states[:, 0], conv_states[:, 1], conv_states[:, 2]
+        D = conv_states.shape[1]
+        assert D % 3 == 0, (
+            f"conv_states channel dim {D} must be divisible by 3 (Q/K/V "
+            "share head_dim assumption)."
+        )
+        q, k, v = jnp.split(conv_states, 3, axis=1)
+        return q, k, v
 
 
 __all__ = ["KDAAttnBackend"]
