@@ -30,6 +30,7 @@ import sys
 from types import SimpleNamespace
 
 import jax
+import jax.lax
 import jax.numpy as jnp
 import numpy as np
 
@@ -164,7 +165,7 @@ def compare_stage(label: str, actual: jax.Array, case: dict, dump_key: str) -> d
     return {"label": label, **m}
 
 
-def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
+def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype, precision):
     T = int(case["T"])
     H = ws["num_heads"]
     D = ws["head_dim"]
@@ -185,14 +186,17 @@ def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
     def w(name):
         return jnp.asarray(ws[name], dtype=dtype)
 
+    def matmul(a, b):
+        return jax.lax.dot(a, b, precision=precision)
+
     rows = []
 
     # ------------------------------------------------------------------
     # Stage 1: Linear projections
     # ------------------------------------------------------------------
-    q_proj = hidden @ w("q_proj_w")
-    k_proj = hidden @ w("k_proj_w")
-    v_proj = hidden @ w("v_proj_w")
+    q_proj = matmul(hidden, w("q_proj_w"))
+    k_proj = matmul(hidden, w("k_proj_w"))
+    v_proj = matmul(hidden, w("v_proj_w"))
     rows.append(compare_stage("1. Q projection", q_proj, case, "intermediates__q_proj"))
     rows.append(compare_stage("1. K projection", k_proj, case, "intermediates__k_proj"))
     rows.append(compare_stage("1. V projection", v_proj, case, "intermediates__v_proj"))
@@ -223,7 +227,7 @@ def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
     # ------------------------------------------------------------------
     # Stage 4: Gate (fused_kda_gate)
     # ------------------------------------------------------------------
-    raw_gate = (hidden @ w("f_a_proj_w")) @ w("f_b_proj_w")
+    raw_gate = matmul(matmul(hidden, w("f_a_proj_w")), w("f_b_proj_w"))
     raw_gate = raw_gate.reshape(T, H, D)
 
     A_log = jnp.asarray(ws["A_log"], dtype=jnp.float32).reshape(H)
@@ -237,7 +241,7 @@ def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
     # ------------------------------------------------------------------
     # Stage 5: Beta (sigmoid)
     # ------------------------------------------------------------------
-    beta = jax.nn.sigmoid((hidden @ w("b_proj_w")).astype(jnp.float32))
+    beta = jax.nn.sigmoid(matmul(hidden, w("b_proj_w")).astype(jnp.float32))
     rows.append(compare_stage("5. Beta (sigmoid)", beta, case, "intermediates__beta"))
 
     # ------------------------------------------------------------------
@@ -311,25 +315,19 @@ def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
     # ------------------------------------------------------------------
     # Stage 8: Output gate
     # ------------------------------------------------------------------
-    g_out = (hidden @ w("g_a_proj_w")) @ w("g_b_proj_w")
+    g_out = matmul(matmul(hidden, w("g_a_proj_w")), w("g_b_proj_w"))
     g_out = g_out.reshape(T, H, D)
     rows.append(compare_stage("8. Output gate (g_out)", g_out, case, "intermediates__g_out"))
 
     # ------------------------------------------------------------------
-    # Stage 9: Output norm — use KDA output from whichever kernel worked
+    # Stage 9: Output norm — use JAX's own KDA output (cumulative)
     # ------------------------------------------------------------------
-    # Pick the best available KDA output for computing o_norm
-    if "intermediates__o_kda_chunk" in case:
-        # Use GPU's own chunk output as input to isolate norm error
-        o_kda = jnp.asarray(case["intermediates__o_kda_chunk"], dtype=dtype)
-        if o_kda.ndim == 4:
-            o_kda = o_kda[0]
-    elif "intermediates__o_kda_fused_recurrent" in case:
-        o_kda = jnp.asarray(case["intermediates__o_kda_fused_recurrent"], dtype=dtype)
-        if o_kda.ndim == 4:
-            o_kda = o_kda[0]
-    else:
-        o_kda = None
+    # Pick whichever JAX kernel output we computed
+    o_kda = None
+    if 'o_chunk' in dir() and o_chunk is not None:
+        o_kda = o_chunk[0]
+    elif 'o_fused' in dir() and o_fused is not None:
+        o_kda = o_fused[0] if o_fused.ndim == 4 else o_fused
 
     if o_kda is not None:
         o_norm_w = jnp.asarray(ws["o_norm_w"], dtype=jnp.float32)
@@ -343,48 +341,18 @@ def run_one_case(ws: dict, case: dict, case_name: str, dtype: jnp.dtype):
         rows.append({"label": "9. Output norm", "skip": True})
 
     # ------------------------------------------------------------------
-    # Stage 10: Final output
+    # Stage 10: Final output — use JAX's own o_norm (cumulative)
     # ------------------------------------------------------------------
-    # Use GPU's o_norm as input to isolate o_proj error
-    if "intermediates__o_norm" in case:
-        o_norm_ref = jnp.asarray(case["intermediates__o_norm"], dtype=dtype)
-        if o_norm_ref.ndim == 4:
-            o_norm_ref = o_norm_ref[0]
-        final = o_norm_ref.reshape(T, proj) @ w("o_proj_w")
-        rows.append(compare_stage("10. Final output (o_proj)", final, case, "out_fp32"))
+    dtype_label = "fp32" if dtype == jnp.float32 else "bf16"
+    out_key = "out_fp32" if dtype == jnp.float32 else "out_bf16"
+    if o_kda is not None:
+        final = matmul(o_normed.reshape(T, proj), w("o_proj_w"))
+        rows.append(compare_stage("10. Final output (o_proj)", final, case, out_key))
     else:
         rows.append({"label": "10. Final output", "skip": True})
 
-    # ------------------------------------------------------------------
-    # End-to-end (for reference)
-    # ------------------------------------------------------------------
-    # Also report the e2e error if we compute everything ourselves
-    dtype_label = "fp32" if dtype == jnp.float32 else "bf16"
-    out_key = "out_fp32" if dtype == jnp.float32 else "out_bf16"
-    if out_key in case and o_kda is not None:
-        # Use our own KDA output (not GPU's) for true e2e
-        try:
-            # Pick whichever kernel output we computed
-            if 'o_chunk' in dir() and o_chunk is not None:
-                our_o = o_chunk[0]
-            elif 'o_fused' in dir() and o_fused is not None:
-                our_o = o_fused[0] if o_fused.ndim == 4 else o_fused
-            else:
-                our_o = None
-
-            if our_o is not None:
-                x_f32 = our_o.astype(jnp.float32)
-                variance = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
-                x_norm = x_f32 * jax.lax.rsqrt(variance + eps)
-                o_norm_w = jnp.asarray(ws["o_norm_w"], dtype=jnp.float32)
-                x_norm = x_norm * o_norm_w
-                our_normed = (x_norm * jax.nn.sigmoid(g_out.astype(jnp.float32))).astype(dtype)
-                our_final = our_normed.reshape(T, proj) @ w("o_proj_w")
-                rows.append(compare_stage("E2E (full pipeline)", our_final, case, out_key))
-        except Exception:
-            pass
-
-    print_table(rows, f"{case_name} ({dtype_label}, T={T}, N={N})")
+    prec_label = str(precision).split(".")[-1] if precision else "DEFAULT"
+    print_table(rows, f"{case_name} ({dtype_label}, T={T}, N={N}, precision={prec_label})")
     return rows
 
 
@@ -397,6 +365,7 @@ def main():
     parser.add_argument("--layer", default="L0", help="Layer dir (default: L0)")
     parser.add_argument("--case", default="single_T128", help="Case name")
     parser.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"])
+    parser.add_argument("--precision", default="default", choices=["default", "high", "highest"])
     parser.add_argument("--all-cases", action="store_true", help="Sweep all 12 cases")
     args = parser.parse_args()
 
@@ -406,6 +375,12 @@ def main():
         sys.exit(1)
 
     dtype = jnp.float32 if args.dtype == "fp32" else jnp.bfloat16
+    precision_map = {
+        "default": jax.lax.Precision.DEFAULT,
+        "high": jax.lax.Precision.HIGH,
+        "highest": jax.lax.Precision.HIGHEST,
+    }
+    precision = precision_map[args.precision]
 
     print(f"Loading weights from {layer_dir}/weights.npz ...")
     ws = load_weights(layer_dir)
@@ -419,7 +394,7 @@ def main():
         except FileNotFoundError as e:
             print(f"\n  {cn}: {e} — skipped")
             continue
-        run_one_case(ws, case, cn, dtype)
+        run_one_case(ws, case, cn, dtype, precision)
 
 
 if __name__ == "__main__":

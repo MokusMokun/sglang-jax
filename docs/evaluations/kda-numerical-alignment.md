@@ -154,6 +154,25 @@ FP32 inputs: `HIGH` improves ~300×, `HIGHEST` ~3000× (near fp32 machine epsilo
 Script: `test/layers/test_matmul_error_minimal.py`.
 Relavant Material: https://docs.jax.dev/en/latest/jax.lax.html#jax.lax.Precision
 
+### Cumulative Error (DEFAULT vs HIGH)
+
+Full pipeline cumulative error on L22, single_T128, FP32 — each stage uses JAX output from the previous stage (not GPU dump):
+
+| Stage | DEFAULT max_abs | HIGH max_abs |
+|-------|----------------|-------------|
+| Q projection | 2.73e-02 | 8.44e-05 |
+| Q conv+SiLU | 3.49e-02 | 8.25e-05 |
+| Gate (fused_kda_gate) | 1.65e+00 | 2.90e-03 |
+| Beta (sigmoid) | 2.84e-03 | 7.09e-06 |
+| KDA output (chunk) | 3.75e-04 | 1.53e-04 |
+| Output gate (g_out) | 3.46e-02 | 9.97e-05 |
+| Output norm | 1.89e-02 | 5.38e-03 |
+| **Final output (E2E)** | **1.78e-02** | **5.75e-03** |
+
+HIGH reduces E2E error ~3× (1.78e-02 → 5.75e-03). Under HIGH, matmul stages no longer dominate — the residual E2E error is driven by the chunk kernel (1.53e-04) amplified through gate and norm.
+
+Script: `test/layers/test_per_stage_intermediates_accumulate.py --precision high`.
+
 ---
 
 ## Pallas Kernel
