@@ -1,80 +1,159 @@
-# Pallas KDA Kernel: NaN with Realistic Gate Magnitudes
+# Pallas KDA Kernel: NaN from Gate Magnitude Overflow
 
-**Date**: 2026-04-26
+**Date**: 2026-04-26 (fixed 2026-04-27)
 **Affected**: `chunk_kda_fwd` in `python/sgl_jax/srt/kernels/kda/kda.py`
 **Kernel origin**: PR #964 (`@pathfinder-pf`)
-**Severity**: Blocking — kernel unusable with real HF weights
+**Fix**: [commit b4c4249](https://github.com/MokusMokun/sglang-jax/commit/b4c4249b2116a00b86324508bba5e4e835520a70)
+**Status**: Fixed (with one known edge-case fallback)
+
+---
 
 ## Summary
 
-The Pallas chunked KDA kernel (`chunk_kda_fwd`) produces NaN output when gate values have magnitude ≥10. Real HF weights from `moonshotai/Kimi-Linear-48B-A3B-Instruct` produce activated gate values in range `[-1922, 0]`, far exceeding this threshold. The naive JAX kernel (`naive_recurrent_kda`) handles the same inputs correctly.
+The Pallas chunked KDA kernel produced NaN whenever activated gate values exceeded ~|10| per step. Real HF weights (`moonshotai/Kimi-Linear-48B-A3B-Instruct`) produce gate values in `[-1922, 0]` — far past this threshold. The naive JAX kernel handled the same inputs correctly.
 
-## What Works vs What Doesn't
+The root cause was **intermediate exp2 overflow** in two places: the intra-chunk attention computation and the inter-chunk state propagation. Both used normalization strategies that broke down when cumulative gate magnitudes exceeded fp32's representable exponent range (~127 for exp2).
 
-| Kernel | Small gate (\|g\| ≤ 5) | Real-weight gate (\|g\| ~ 1900) |
-|--------|------------------------|----------------------------------|
-| `naive_recurrent_kda` (pure JAX) | ✓ | ✓ |
-| `chunk_kda_fwd` (Pallas) | ✓ | **NaN** |
+The fix replaces both normalization strategies with monotonicity-aware reference points that guarantee exp2 arguments are always non-positive, keeping results in `(0, 1]`.
 
-## Where the NaN Comes From
+---
 
-The KDA forward has a 4-stage pipeline. The NaN originates in the **gate cumsum** and **inter-chunk state propagation** stages — NOT in the gate activation step.
+## Root Cause
 
-### 问题追溯
+### Background: gate values in KDA
 
-gate 值在 kernel 里的关键使用点是 `kda_gate_chunk_cumsum`（`kda.py` ~line 1000–1033）：
+KDA's gating mechanism produces per-step decay factors. The activated gate values are:
+
+```
+g_act = -exp(A_log) * softplus(g + dt_bias)
+```
+
+These are always non-positive (decay only). With real weights, individual steps produce values around `-60`. The kernel works in log2-space, converting via `scale = 1/ln(2)`, so each step contributes ~`-86.6` in log2-space.
+
+The chunked kernel accumulates these into cumsums over chunks of 64 steps. Since gates are monotonically non-positive, the cumsum is **monotonically decreasing**:
+
+```
+g_cumsum[0] ≥ g_cumsum[1] ≥ ... ≥ g_cumsum[63]
+```
+
+### The overflow mechanism
+
+Both broken code paths needed to compute `exp2(g_cumsum[i])` but tried to avoid direct exponentiation of large negative values by using a reference point. The problem was that the chosen reference points produced **positive** exp2 arguments that overflowed:
+
+**Intra-chunk (sub-chunk attention):**
+
+The kernel split each chunk into NC sub-chunks of size BC=16. It picked a midpoint reference `gn = g[BC//2]` and computed:
 
 ```python
-def kda_gate_chunk_cumsum(g, A_log, chunk_size, scale=None, dt_bias=None, ...):
-    g_f32 = g.astype(jnp.float32)
-    if dt_bias is not None:
-        g_f32 = g_f32 + dt_bias.reshape(H, K)
-
-    A = A_log.astype(jnp.float32)
-    # 这一步产生大负值：-exp(2.77~5.3) * softplus(x) → 范围 [-1922, 0]
-    g_act = -exp(A).reshape(1, 1, H, 1) * jax.nn.softplus(g_f32)
-
-    # 然后做 chunk-local cumsum，scale = 1/ln(2)
-    return chunk_local_cumsum_vector(g_act, chunk_size=chunk_size, scale=scale, ...)
+q_eg  = q * exp2(g[i] - gn)    # query side
+k_eng = k * exp2(gn - g[j])    # key side — gn > g[j], so argument is POSITIVE
 ```
 
-其中 `scale = _RCP_LN2 = 1/ln(2) ≈ 1.4427`，是把 log-space 转成 log2-space 的常数，不是问题来源。
+With gate ~ -86.6/step, a 16-step sub-chunk accumulates ~-1386. The midpoint `gn` sits at ~-693, so `gn - g[15]` ≈ +693 — `exp2(693)` overflows to inf, producing NaN in the dot product.
 
-真正的问题是 `g_act` 本身的量级：`-exp(A_log) * softplus(g + dt_bias)` 产生的值（~-60 per timestep），经过 64 步 cumsum 累积到 ~-3840，然后下游的 Pallas kernel 对这个 cumsum 做 `exp()` / `log2()` 变换时溢出。
+**Inter-chunk (state propagation):**
 
-**Workaround 方向**：问题不在于能不能绕过某个参数，而在于 Pallas kernel 缺少 per-chunk normalization。具体来说：
+Similar issue — the code used `g_mid = (g[0] + g[-1]) * 0.5` as reference. With large gates, `exp2(g_mid)` itself could overflow.
 
-1. **Safe gate normalization** — 在每个 chunk 内，cumsum 前减去 chunk 内最大值（或用 chunk 边界值做 baseline），让 `exp(cumsum - baseline)` 始终在可表示范围内。GPU 的 fla Triton kernel 大概率做了类似处理。
-2. **`safe_gate` 参数无效** — kernel 里有个 `safe_gate` 参数（默认 `True`，line 334/456），但从代码看它只影响取 cumsum 的中间值位置（`g_i[BC//2 : BC//2+1]` vs `g_i[0:1]`），不是真正的数值稳定化。
+### Why the naive kernel was fine
 
-结论：没有简单的参数级 workaround —— 需要改 Pallas kernel 内部的数值处理逻辑。
+`naive_recurrent_kda` processes one timestep at a time: `S = S * exp(g_t)`. Each `exp(-60)` ≈ `8.7e-27` — a tiny but valid float. No cumsum, no reference point, no overflow.
 
-### Data flow (simplified)
+---
 
+## The Fix
+
+Three changes in the kernel, plus one fallback in the backend. All exploit the same insight: **because gate cumsums are monotonically decreasing, `g[i] - g[j] ≤ 0` for `i ≥ j`, so `exp2(g[i] - g[j])` is always in `(0, 1]`.**
+
+### 1. Intra-chunk: direct pairwise difference (eliminates sub-chunk loops)
+
+**Before:** NC×NC nested loop over sub-chunks with midpoint reference `gn`, producing `exp2(gn - g[j])` that overflows.
+
+**After:** Compute the full `BT × BT` pairwise difference matrix directly:
+
+```python
+g_diff = g[i, k] - g[j, k]          # shape [BT, BT, K]
+g_diff = where(causal, g_diff, -126)  # mask anti-causal to safe value
+decay  = exp2(max(g_diff, -126))      # always in (0, 1] for causal pairs
+
+Aqk = scale * sum_k(q[i,k] * decay[i,j,k] * k[j,k])  # [BT, BT]
+L   = sum_k(k[i,k] * decay[i,j,k] * k[j,k]) * beta    # [BT, BT], strict causal
 ```
-raw_gate g  →  gate activation  →  cumsum  →  exp(cumsum)  →  inter-chunk propagation  →  output
-                                     ↑                ↑
-                              accumulates to      exp(-3840) is fine (≈0),
-                              very large negative  but log2/exp intermediate
-                              values (-3840+)      arithmetic overflows → NaN
+
+The key insight: for causal pairs (`i ≥ j`), `g_cumsum[i] ≤ g_cumsum[j]`, so `g_diff ≤ 0` and `exp2` never exceeds 1. The `max(..., -126)` clamp prevents underflow to denormals but doesn't affect correctness since `exp2(-126) ≈ 1.2e-38` is effectively zero.
+
+This also simplifies the code: the NC×NC sub-chunk double loop is replaced by a single broadcast computation.
+
+### 2. Inter-chunk: first-position reference instead of midpoint
+
+**Before:**
+
+```python
+g_mid = (g[0] + g[-1]) * 0.5          # midpoint — can be large negative
+qg    = q * exp2(g - g_mid)           # g - g_mid can be positive
+h_s   = h * exp2(g_mid)               # exp2(large negative) underflows
 ```
 
-### Why `use_gate_in_kernel` doesn't help
+**After:**
 
-Regardless of where gate activation happens (inside kernel via `use_gate_in_kernel=True`, or pre-computed externally with `=False`), the same large negative activated gate values enter the Pallas cumsum + state propagation stages. Both paths produce NaN:
-
+```python
+g_ref = g[0]                           # first position = largest cumsum value
+qg    = q * exp2(max(g - g_ref, -126)) # g[t] - g[0] ≤ 0 always, safe
+h_s   = h * exp2(max(g_ref, -126))     # single reference scaling
 ```
-use_gate_in_kernel=True:   NaN  (24576/32768 elements)
-use_gate_in_kernel=False:  NaN  (21632/32768 elements)
+
+Since `g[0]` is the maximum of the monotonically decreasing cumsum, `g[t] - g[0] ≤ 0` for all `t`, keeping exp2 in `(0, 1]`.
+
+### 3. Padding fix for `use_gate_in_kernel=True`
+
+An independent bug: `_align_seqs` pads gate values with 0 for variable-length sequence packing. But when gates are activated inside the kernel, `softplus(0 + dt_bias) ≠ 0` — padding positions get non-zero gate activation, corrupting `g_last` (state propagation) and `kg` (state update).
+
+Fix: replace padding value with `-1e4`, making `softplus(-1e4 + dt_bias) ≈ 0` and neutralizing padding positions.
+
+```python
+if use_gate_in_kernel:
+    valid_mask = ...  # True for real token positions, False for padding
+    g = where(valid_mask, g, -1e4)
 ```
 
-### Why the naive kernel works
+### 4. Backend fallback for short-sequence batches
 
-`naive_recurrent_kda` processes one timestep at a time: `S = S * exp(g_t)`. Each `exp(g_t)` where `g_t ≈ -60` produces a very small but valid float (~1e-26). The state decays toward zero — no overflow, no NaN.
+When total packed tokens ≤ `chunk_size` (64) and there are multiple sequences, every sequence is shorter than one chunk. The kernel pads each to chunk_size, but the padding causes precision loss in the inter-chunk state contribution due to exp2 underflow. The backend falls back to the naive kernel in this case:
+
+```python
+BT = 64
+if T > BT or N <= 1:
+    return self._forward_extend_pallas(...)
+return self._forward_extend_naive(...)
+```
+
+---
+
+## Why Simpler Fixes Don't Work
+
+Several approaches were tested during diagnosis and all failed:
+
+| Approach | Why it fails |
+|----------|-------------|
+| **Clamp gate values** to `[-C, 0]` | Even clamp=3 still NaN (cumsum of 64 × 3 = 192 still exceeds exp2 range). Clamping small enough to work (~1.5) changes model semantics. |
+| **Per-chunk cumsum normalization** (subtract first position) | Only shifts the range by one step's contribution. Intra-chunk exp2 on 16-step sub-chunks still overflows. |
+| **`safe_gate` parameter** | Only changes which position is used as reference (`g[BC//2]` vs `g[0]`), doesn't address the fundamental sign problem of `gn - g[j]`. |
+| **`use_gate_in_kernel` toggle** | Both paths feed the same large activated gate values into the same problematic exp2 computations. |
+
+The fix works because it's the only approach that guarantees **all exp2 arguments are non-positive** — a structural invariant, not a magnitude-dependent heuristic.
+
+---
+
+## Additional Bugs Found During Testing
+
+1. **Missing `max_T` in `chunk_local_cumsum_vector`** (line 216): `prepare_chunk_indices(cu_seqlens, BT)` called without `max_T`, causing `TypeError`.
+2. **Inverted `chunk_indices` guard in `chunk_kda_fwd`** (line 1206): `if chunk_indices is not None:` should be unconditional — `chunk_indices` must always be computed for varlen operation.
+
+---
 
 ## Reproduction
 
-Tested on: TPU v6e-4, JAX 0.8.1 (libtpu 0.0.30) and JAX 0.9.2 (libtpu 0.0.38). Both produce NaN.
+Tested on TPU v6e-4 with JAX 0.8.1 and 0.9.2. Before fix, NaN at gate_scale ≥ 10:
 
 ```python
 import jax, jax.numpy as jnp
@@ -84,87 +163,12 @@ H, K, V, T = 32, 128, 128, 128
 q = jax.random.normal(jax.random.PRNGKey(0), (1, T, H, K), dtype=jnp.float32) * 0.1
 k = jax.random.normal(jax.random.PRNGKey(1), (1, T, H, K), dtype=jnp.float32) * 0.1
 v = jax.random.normal(jax.random.PRNGKey(2), (1, T, H, V), dtype=jnp.float32) * 0.1
+g = -jnp.abs(jax.random.normal(jax.random.PRNGKey(3), (1, T, H, K), dtype=jnp.float32)) * 1000
 beta = jax.random.uniform(jax.random.PRNGKey(4), (1, T, H), dtype=jnp.float32)
 cu = jnp.array([0, T], dtype=jnp.int32)
 init = jnp.zeros((1, H, K, V), dtype=jnp.float32)
 
-for gate_scale in [1, 10, 50, 100, 500, 1000, 2000]:
-    g = -jnp.abs(jax.random.normal(jax.random.PRNGKey(3), (1, T, H, K), dtype=jnp.float32)) * gate_scale
-    o, fs, *_ = chunk_kda(q, k, v, g, beta, scale=K**-0.5,
-        initial_state=init, output_final_state=True, cu_seqlens=cu)
-    nan_pct = jnp.isnan(o).sum() / o.size * 100
-    print(f"gate_scale={gate_scale:5d} | nan: {nan_pct:.0f}%")
+o, fs, *_ = chunk_kda(q, k, v, g, beta, scale=K**-0.5,
+    initial_state=init, output_final_state=True, cu_seqlens=cu)
+print(f"NaN: {jnp.isnan(o).any()}")  # True before fix, False after
 ```
-
-Output:
-```
-gate_scale=    1 | nan: 0%
-gate_scale=   10 | nan: 100%    ← threshold
-gate_scale=   50 | nan: 100%
-gate_scale=  100 | nan: 100%
-gate_scale=  500 | nan: 100%
-gate_scale= 1000 | nan: 100%
-gate_scale= 2000 | nan: 100%
-```
-
-### Why gate clamping doesn't help
-
-Tested clamping activated gate to [-C, 0] before passing to kernel. Even aggressive clamping (C=3) still NaN:
-
-```
-clamp=3:  pallas NaN=True   naive(clamped) vs naive(raw) diff = 4.4e-04
-clamp=5:  pallas NaN=True   naive(clamped) vs naive(raw) diff = 6.1e-05
-clamp=7:  pallas NaN=True   naive(clamped) vs naive(raw) diff = 8.5e-06
-clamp=10: pallas NaN=True   naive(clamped) vs naive(raw) diff = 4.4e-07
-```
-
-Further investigation shows the threshold is per-chunk cumsum magnitude ~100, which corresponds to per-element average of ~-1.5:
-
-| Gate values | Per-element avg | Chunk cumsum (64 steps) | Result |
-|-------------|-----------------|------------------------|--------|
-| scale=1 (range [-5, 0]) | ~-0.8 | ~-51 | ✓ |
-| uniform -3 | -3.0 | -192 | **NaN** |
-| scale=3 (range [-15, 0]) | ~-2.4 | -154 | **NaN** |
-| Real weights | ~-30 | ~-1920 | **NaN** |
-
-Clamping to stay under the threshold (individual gate ~-1.5) would change model behavior from "fully forgotten" to "22% retention per step" — not acceptable.
-
-### Why per-chunk normalization of cumsum doesn't help either
-
-Tested subtracting the first position's cumsum value within each chunk (64 steps) before passing to downstream Pallas functions:
-
-```
-raw cumsum:    [-5178, 0]
-normed cumsum: [-5151, 0]   ← barely changed
-intra-chunk:   all NaN
-inter-chunk:   all NaN
-```
-
-The problem is **intra-chunk**, not inter-chunk. Within a single chunk of 64 steps, gate ≈ -50 per step (activated), scaled by `1/ln(2)` ≈ 1.44:
-
-- Per-step in log2-space: ~-72
-- 16-step sub-chunk (BC=16) cumsum: ~-1154
-- `exp2(-1154)` → underflow to 0
-- `exp2(+578)` (midpoint reference, reverse direction) → overflow to inf
-
-Even at the finest granularity the kernel uses (BC=16 sub-chunks), the cumsum magnitude (~1154) far exceeds fp32 representable range for exp2 (max ~127). **No reference-subtraction trick can fix this — the per-step gate values themselves are too large for chunked exp2 arithmetic.**
-
-## Suggested Fix Direction
-
-The Pallas kernel needs an **algorithmic rewrite** for gate handling, not a parameter-level fix:
-
-1. **Full log-space arithmetic**: Keep gate cumsums in log-space throughout the intra-chunk and inter-chunk computation. Only materialize `exp()` at the final output stage where relative differences are small.
-2. **Per-element online normalization**: Track a running max/normalization factor per element and renormalize at each step, similar to online softmax.
-3. **Reference**: Study fla's Triton `chunk_kda` kernel (fla-org/flash-linear-attention) for the numerical strategy used on GPU.
-
-## Additional Kernel Bugs Found During Testing
-
-1. **Missing `max_T` in `chunk_local_cumsum_vector`** (line 216): `prepare_chunk_indices(cu_seqlens, BT)` called without `max_T`, causing `TypeError`. Fixed locally by passing `max_T=T`.
-
-2. **`chunk_kda_fwd` skips `chunk_indices` computation when `None`** (line 1206): The condition `if chunk_indices is not None:` is inverted — `chunk_indices` must always be computed for varlen operation. Downstream functions assert it's not None. Fixed locally by making it unconditional.
-
-## Impact on Sub-3
-
-- **Phase A** (KimiDeltaAttention layer + backend gate changes): Complete and committed.
-- **Phase B** (M1 numerical alignment tests): **Blocked**. Tests written but cannot verify output against GPU reference due to NaN.
-- **Phase C** (prefill-to-decode invariance): Can proceed using the naive kernel (decode path).

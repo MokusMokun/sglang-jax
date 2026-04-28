@@ -60,6 +60,106 @@ Error grows ~20x L0→L22 (prefill), ~4x (decode) — deeper layers have larger 
 
 ---
 
+## Error Source Analysis
+
+### Isolated Per-Stage Comparison
+
+Each stage receives the **GPU dump intermediate** as input, isolating that stage's own JAX-vs-GPU error from upstream accumulation.
+
+**L22, single_T128, FP32:**
+
+| Stage | Input source | max_abs | mean_abs |
+|-------|-------------|---------|----------|
+| Q projection | hidden_states | <u>2.73e-02</u> | <u>2.60e-03</u> |
+| K projection | hidden_states | <u>2.61e-02</u> | <u>2.49e-03</u> |
+| V projection | hidden_states | <u>2.23e-02</u> | <u>3.03e-03</u> |
+| Q conv+SiLU | GPU q_proj | 1.91e-06 | 5.38e-09 |
+| K conv+SiLU | GPU k_proj | 3.81e-06 | 7.29e-09 |
+| V conv+SiLU | GPU v_proj | 1.43e-06 | 1.58e-08 |
+| Gate (fused_kda_gate) | hidden_states | **1.65e+00** | **5.61e-03** |
+| Beta (sigmoid) | hidden_states | 2.84e-03 | 3.64e-04 |
+| KDA output (chunk) | GPU post-conv + g + beta | 1.61e-04 | 1.81e-06 |
+| KDA output (fused_rec) | GPU post-conv + g + beta | 1.19e-07 | 9.50e-10 |
+| Recurrent state (fused) | GPU post-conv + g + beta | 8.34e-07 | 5.96e-09 |
+| Output gate (g_out) | hidden_states | <u>3.46e-02</u> | <u>2.42e-03</u> |
+| Output norm | GPU o_kda + GPU g_out | 7.15e-07 | 5.31e-09 |
+| Final output (o_proj) | GPU o_norm | 1.14e-02 | 8.55e-04 |
+
+**L22, single_T128, BF16:**
+
+| Stage | Input source | max_abs | mean_abs |
+|-------|-------------|---------|----------|
+| Q projection | hidden_states | 3.80e-02 | <u>3.56e-03</u> |
+| K projection | hidden_states | <u>5.11e-02</u> | <u>3.42e-03</u> |
+| V projection | hidden_states | 4.17e-02 | <u>4.16e-03</u> |
+| Q conv+SiLU | GPU q_proj | <u>7.77e-02</u> | 2.46e-04 |
+| K conv+SiLU | GPU k_proj | <u>1.24e-01</u> | 3.16e-04 |
+| V conv+SiLU | GPU v_proj | 3.76e-02 | 7.06e-04 |
+| Gate (fused_kda_gate) | hidden_states | **2.46e+00** | **7.35e-03** |
+| Beta (sigmoid) | hidden_states | 2.96e-03 | 4.32e-04 |
+| KDA output (chunk) | GPU post-conv + g + beta | 9.42e-04 | 5.20e-06 |
+| KDA output (fused_rec) | GPU post-conv + g + beta | 7.92e-04 | 4.12e-06 |
+| Recurrent state (fused) | GPU post-conv + g + beta | 6.01e-03 | 3.49e-05 |
+| Output gate (g_out) | hidden_states | <u>4.49e-02</u> | <u>2.97e-03</u> |
+| Output norm | GPU o_kda + GPU g_out | 1.72e-02 | 1.97e-04 |
+| Final output (o_proj) | GPU o_norm | 1.32e-02 | 1.14e-03 |
+
+BF16 conv error (~8e-2) is larger because GPU dump intermediates are fp32 while JAX conv runs in bf16 — the error is bf16 truncation, not algorithmic.
+
+### Error Pipeline Summary
+
+| Path | Stage | Isolated error | Source |
+|------|-------|---------------|--------|
+| hidden → q/k/v | projection matmul | <u>~2e-2</u> | cross-device accumulation |
+| q/k/v → heads | conv+SiLU (K=4) | ~2e-6 | negligible |
+| heads → normed | L2 norm | — | elementwise |
+| hidden → raw_gate | gate projection (2 matmuls) | <u>~2e-2</u> | cross-device accumulation |
+| raw_gate → g | fused_kda_gate | **~2e+0** | exp(A_log) amplifies matmul error |
+| hidden → beta | sigmoid | ~3e-3 | cross-device accumulation |
+| normed+g+beta → o | fused_recurrent kernel | ~1e-7 | near bit-exact |
+| normed+g+beta → o | chunk/Pallas kernel | ~2e-4 | chunked accumulation |
+| hidden → g_out | output gate projection | <u>~3e-2</u> | cross-device accumulation |
+| o+g_out → o_norm | GatedRMSNorm | ~7e-7 | elementwise |
+| o_norm → output | o_proj matmul | <u>~1e-2</u> | cross-device accumulation |
+
+### Key Findings
+
+1. **All error originates from matmul stages.** Input projections (`[T, 2304] @ [2304, 4096]`, ~2e-2) and output projection (`[T, 4096] @ [4096, 2304]`, ~1e-2) dominate. Conv (~2e-6), fused recurrent (~1e-7), and GatedRMSNorm (~7e-7) are at or near machine epsilon.
+
+2. **Gate max_abs (1.65e+00) is a scaling artifact.** Gate computes `-exp(A_log) * softplus(raw_gate + dt_bias)`. L22's A_log reaches 4.14, giving exp(A_log) = 62.7×. This amplifies the ~2e-2 matmul error: 62.7 × 2.6e-2 ≈ 1.63. Relative error is only ~0.2%.
+
+3. **Matmul error is inherent cross-device divergence** in accumulation order (GPU CUDA vs TPU XLA) and is not optimizable within the JAX implementation.
+
+### Minimal Reproduction
+
+Single matmul `hidden_states [128, 2304] @ q_proj_w [2304, 4096]` on L22, GPU dump vs TPU:
+
+| | FP32 | BF16 |
+|---|---|---|
+| max_abs | 2.73e-02 | 3.80e-02 |
+| mean_abs | 2.60e-03 | 3.56e-03 |
+| \|abs\| p50 | 2.12e-03 | 2.79e-03 |
+| \|abs\| p99 | 9.27e-03 | 1.43e-02 |
+
+Input x ~ N(0, 1), weights std = 4.2e-2, output range ±15. Error median ~2e-3, 99th ~1e-2 — matching the isolated per-stage projection error. Script: `test/layers/test_matmul_error_minimal.py`.
+
+---
+
+## Pallas Kernel
+
+Pallas chunked kernel (`chunk_kda_fwd`) is enabled by default. Shape-based routing: Pallas when `T > 64` or `N ≤ 1`, naive fallback for short multi-sequence batches.
+
+| Case category | Pallas vs Naive |
+|---------------|----------------|
+| Single seq, T ≤ 256 | tie |
+| Single seq, T = 1024 | Pallas ~1.05× better |
+| **Varlen (multi-seq packed)** | **Pallas 1.2–1.4× better** |
+| With initial state | tie |
+
+Pallas's main advantage is varlen packed scenarios (parallel chunk processing vs naive per-sequence loop).
+
+---
+
 ## Per-Layer Details
 
 ### L0 — Best Case (all tight)
@@ -153,93 +253,6 @@ Error grows ~20x L0→L22 (prefill), ~4x (decode) — deeper layers have larger 
 ### L6, L13
 
 All 28 non-skip tests pass at loose tolerance. Per-case tables omitted — see cross-layer summary for worst-case numbers. Full data in `test_kda_backend.py` test output.
-
----
-
-## Error Source Analysis
-
-### Isolated Per-Stage Comparison
-
-Each stage receives the **GPU dump intermediate** as input, isolating that stage's own JAX-vs-GPU error from upstream accumulation.
-
-**L22, single_T128, FP32:**
-
-| Stage | Input source | max_abs | mean_abs |
-|-------|-------------|---------|----------|
-| Q projection | hidden_states | <u>2.73e-02</u> | <u>2.60e-03</u> |
-| K projection | hidden_states | <u>2.61e-02</u> | <u>2.49e-03</u> |
-| V projection | hidden_states | <u>2.23e-02</u> | <u>3.03e-03</u> |
-| Q conv+SiLU | GPU q_proj | 1.91e-06 | 5.38e-09 |
-| K conv+SiLU | GPU k_proj | 3.81e-06 | 7.29e-09 |
-| V conv+SiLU | GPU v_proj | 1.43e-06 | 1.58e-08 |
-| Gate (fused_kda_gate) | hidden_states | **1.65e+00** | **5.61e-03** |
-| Beta (sigmoid) | hidden_states | 2.84e-03 | 3.64e-04 |
-| KDA output (chunk) | GPU post-conv + g + beta | 1.61e-04 | 1.81e-06 |
-| KDA output (fused_rec) | GPU post-conv + g + beta | 1.19e-07 | 9.50e-10 |
-| Recurrent state (fused) | GPU post-conv + g + beta | 8.34e-07 | 5.96e-09 |
-| Output gate (g_out) | hidden_states | <u>3.46e-02</u> | <u>2.42e-03</u> |
-| Output norm | GPU o_kda + GPU g_out | 7.15e-07 | 5.31e-09 |
-| Final output (o_proj) | GPU o_norm | 1.14e-02 | 8.55e-04 |
-
-**L22, single_T128, BF16:**
-
-| Stage | Input source | max_abs | mean_abs |
-|-------|-------------|---------|----------|
-| Q projection | hidden_states | 3.80e-02 | <u>3.56e-03</u> |
-| K projection | hidden_states | <u>5.11e-02</u> | <u>3.42e-03</u> |
-| V projection | hidden_states | 4.17e-02 | <u>4.16e-03</u> |
-| Q conv+SiLU | GPU q_proj | <u>7.77e-02</u> | 2.46e-04 |
-| K conv+SiLU | GPU k_proj | <u>1.24e-01</u> | 3.16e-04 |
-| V conv+SiLU | GPU v_proj | 3.76e-02 | 7.06e-04 |
-| Gate (fused_kda_gate) | hidden_states | **2.46e+00** | **7.35e-03** |
-| Beta (sigmoid) | hidden_states | 2.96e-03 | 4.32e-04 |
-| KDA output (chunk) | GPU post-conv + g + beta | 9.42e-04 | 5.20e-06 |
-| KDA output (fused_rec) | GPU post-conv + g + beta | 7.92e-04 | 4.12e-06 |
-| Recurrent state (fused) | GPU post-conv + g + beta | 6.01e-03 | 3.49e-05 |
-| Output gate (g_out) | hidden_states | <u>4.49e-02</u> | <u>2.97e-03</u> |
-| Output norm | GPU o_kda + GPU g_out | 1.72e-02 | 1.97e-04 |
-| Final output (o_proj) | GPU o_norm | 1.32e-02 | 1.14e-03 |
-
-BF16 conv error (~8e-2) is larger because GPU dump intermediates are fp32 while JAX conv runs in bf16 — the error is bf16 truncation, not algorithmic.
-
-### Error Pipeline Summary
-
-| Path | Stage | Isolated error | Source |
-|------|-------|---------------|--------|
-| hidden → q/k/v | projection matmul | <u>~2e-2</u> | cross-device accumulation |
-| q/k/v → heads | conv+SiLU (K=4) | ~2e-6 | negligible |
-| heads → normed | L2 norm | — | elementwise |
-| hidden → raw_gate | gate projection (2 matmuls) | <u>~2e-2</u> | cross-device accumulation |
-| raw_gate → g | fused_kda_gate | **~2e+0** | exp(A_log) amplifies matmul error |
-| hidden → beta | sigmoid | ~3e-3 | cross-device accumulation |
-| normed+g+beta → o | fused_recurrent kernel | ~1e-7 | near bit-exact |
-| normed+g+beta → o | chunk/Pallas kernel | ~2e-4 | chunked accumulation |
-| hidden → g_out | output gate projection | <u>~3e-2</u> | cross-device accumulation |
-| o+g_out → o_norm | GatedRMSNorm | ~7e-7 | elementwise |
-| o_norm → output | o_proj matmul | <u>~1e-2</u> | cross-device accumulation |
-
-### Key Findings
-
-1. **All error originates from matmul stages.** Input projections (`[T, 2304] @ [2304, 4096]`, ~2e-2) and output projection (`[T, 4096] @ [4096, 2304]`, ~1e-2) dominate. Conv (~2e-6), fused recurrent (~1e-7), and GatedRMSNorm (~7e-7) are at or near machine epsilon.
-
-2. **Gate max_abs (1.65e+00) is a scaling artifact.** Gate computes `-exp(A_log) * softplus(raw_gate + dt_bias)`. L22's A_log reaches 4.14, giving exp(A_log) = 62.7×. This amplifies the ~2e-2 matmul error: 62.7 × 2.6e-2 ≈ 1.63. Relative error is only ~0.2%.
-
-3. **Matmul error is inherent cross-device divergence** in accumulation order (GPU CUDA vs TPU XLA) and is not optimizable within the JAX implementation.
-
----
-
-## Pallas Kernel
-
-Pallas chunked kernel (`chunk_kda_fwd`) is enabled by default. Shape-based routing: Pallas when `T > 64` or `N ≤ 1`, naive fallback for short multi-sequence batches.
-
-| Case category | Pallas vs Naive |
-|---------------|----------------|
-| Single seq, T ≤ 256 | tie |
-| Single seq, T = 1024 | Pallas ~1.05× better |
-| **Varlen (multi-seq packed)** | **Pallas 1.2–1.4× better** |
-| With initial state | tie |
-
-Pallas's main advantage is varlen packed scenarios (parallel chunk processing vs naive per-sequence loop).
 
 ---
 
