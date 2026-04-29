@@ -55,6 +55,9 @@ jax.set_mesh(_TEST_MESH)
 
 DUMP_BASE = os.environ.get("KDA_DUMP_DIR", "/models/yuhao/kimi-linear/kda_module")
 DEFAULT_LAYER = os.environ.get("KDA_DUMP_LAYER", "L0")
+FULL_DUMP_BASE = os.environ.get(
+    "KDA_FULL_DUMP_DIR", "/models/yuhao/kimi-linear/kda_full_model_dump"
+)
 
 
 def _layer_dir():
@@ -512,4 +515,142 @@ class TestKDAModuleDecode:
             DECODE_BF16_ATOL_LOOSE,
             DECODE_BF16_RTOL_LOOSE,
             f"{case_name} decode bf16",
+        )
+
+
+# ===================================================================
+# Full-model alignment tests
+# ===================================================================
+
+# GPU full-model ran in bf16 — wider tolerances than isolated fp32 dumps.
+FM_FP32_ATOL_TIGHT = 1e-2
+FM_FP32_RTOL_TIGHT = 1e-2
+FM_FP32_ATOL_LOOSE = 1e-1
+FM_FP32_RTOL_LOOSE = 1e-1
+
+FM_BF16_ATOL_TIGHT = 5e-2
+FM_BF16_RTOL_TIGHT = 5e-2
+FM_BF16_ATOL_LOOSE = 5e-1
+FM_BF16_RTOL_LOOSE = 5e-1
+
+# Layers with both isolated weight dumps and full-model activation dumps.
+# (isolated_layer_name, model_layer_idx)
+# All 20 KDA layers from Kimi-Linear-48B.
+FULL_MODEL_LAYERS = [
+    ("L0", 0),
+    ("L1", 1),
+    ("L2", 2),
+    ("L4", 4),
+    ("L5", 5),
+    ("L6", 6),
+    ("L8", 8),
+    ("L9", 9),
+    ("L10", 10),
+    ("L12", 12),
+    ("L13", 13),
+    ("L14", 14),
+    ("L16", 16),
+    ("L17", 17),
+    ("L18", 18),
+    ("L20", 20),
+    ("L21", 21),
+    ("L22", 22),
+    ("L24", 24),
+    ("L25", 25),
+]
+
+
+class TestKDAModuleFullModel:
+    """End-to-end alignment using full-model real activations.
+
+    Loads weights from isolated dumps (weights.npz) and feeds
+    real activations from the full-model dump (layer_NN.npz).
+    Compares JAX module output vs GPU reference.
+
+    Note: GPU full-model ran in bf16, so tolerances are wider
+    than isolated-dump tests (which used fp32 reference).
+    """
+
+    @pytest.fixture(scope="class", autouse=True)
+    def _check_dumps(self):
+        if not os.path.isdir(FULL_DUMP_BASE):
+            pytest.skip(f"Full-model dumps not found at {FULL_DUMP_BASE}")
+
+    @pytest.mark.parametrize(
+        "layer_name,layer_idx", FULL_MODEL_LAYERS,
+        ids=[f"L{idx}" for _, idx in FULL_MODEL_LAYERS],
+    )
+    def test_full_model_fp32(self, layer_name, layer_idx):
+        weights_path = os.path.join(DUMP_BASE, layer_name, "weights.npz")
+        if not os.path.isfile(weights_path):
+            pytest.skip(f"Weights not found: {weights_path}")
+
+        layer_path = os.path.join(FULL_DUMP_BASE, f"layer_{layer_idx:02d}.npz")
+        if not os.path.isfile(layer_path):
+            pytest.skip(f"Full-model dump not found: {layer_path}")
+
+        module = _build_module(weights_path, dtype=jnp.float32)
+        layer_data = dict(np.load(layer_path, allow_pickle=True))
+
+        hidden = jnp.asarray(layer_data["input_hidden_states"], dtype=jnp.float32)
+        T = hidden.shape[1]  # [B, T, D]
+        hidden = hidden[0]  # [T, D]
+
+        fb, pool = _build_extend_env(module, T)
+        output, _ = module(None, hidden, fb, pool)
+        output_np = np.asarray(output, dtype=np.float32)
+
+        expected = layer_data["output"]
+        if output_np.ndim == 2 and expected.ndim == 3:
+            output_np = output_np[None, ...]
+
+        _assert_two_tier(
+            output_np,
+            expected,
+            FM_FP32_ATOL_TIGHT,
+            FM_FP32_RTOL_TIGHT,
+            FM_FP32_ATOL_LOOSE,
+            FM_FP32_RTOL_LOOSE,
+            f"full_model_L{layer_idx} fp32",
+        )
+
+    @pytest.mark.parametrize(
+        "layer_name,layer_idx", FULL_MODEL_LAYERS,
+        ids=[f"L{idx}" for _, idx in FULL_MODEL_LAYERS],
+    )
+    def test_full_model_bf16(self, layer_name, layer_idx):
+        weights_path = os.path.join(DUMP_BASE, layer_name, "weights.npz")
+        if not os.path.isfile(weights_path):
+            pytest.skip(f"Weights not found: {weights_path}")
+
+        layer_path = os.path.join(FULL_DUMP_BASE, f"layer_{layer_idx:02d}.npz")
+        if not os.path.isfile(layer_path):
+            pytest.skip(f"Full-model dump not found: {layer_path}")
+
+        module = _build_module(weights_path, dtype=jnp.bfloat16)
+        layer_data = dict(np.load(layer_path, allow_pickle=True))
+
+        hidden = jnp.asarray(layer_data["input_hidden_states"], dtype=jnp.bfloat16)
+        T = hidden.shape[1]
+        hidden = hidden[0]
+
+        fb, pool = _build_extend_env(module, T)
+        output, _ = module(None, hidden, fb, pool)
+        output_np = np.asarray(output, dtype=np.float32)
+
+        expected = layer_data["output"]
+        if output_np.ndim == 2 and expected.ndim == 3:
+            output_np = output_np[None, ...]
+
+        assert not np.isnan(output_np).any(), (
+            f"full_model_L{layer_idx}: NaN in bf16 output"
+        )
+        _assert_two_tier(
+            output_np,
+            expected,
+            FM_BF16_ATOL_TIGHT,
+            FM_BF16_RTOL_TIGHT,
+            FM_BF16_ATOL_LOOSE,
+            FM_BF16_RTOL_LOOSE,
+            f"full_model_L{layer_idx} bf16",
         )

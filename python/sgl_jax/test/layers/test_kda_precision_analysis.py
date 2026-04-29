@@ -1,23 +1,25 @@
 """KDA per-stage precision analysis using production pipeline with intermediates capture.
 
-Three analysis modes:
+Four analysis modes:
 
-  matmul-only   Single Q-projection matmul at three TPU precision levels
-                (DEFAULT / HIGH / HIGHEST). Isolates the dominant error source.
+  matmul-only    Single Q-projection matmul at three TPU precision levels
+                 (DEFAULT / HIGH / HIGHEST). Isolates the dominant error source.
 
-  pipeline      Run the production KimiDeltaAttention forward pass with
-                capture_intermediates, compare each stage against GPU dump.
-                Shows cumulative error propagation through the real pipeline.
+  accumulated    Run the production KimiDeltaAttention forward pass with
+                 capture_intermediates, compare each stage against GPU dump.
+                 Shows accumulated error propagation through the real pipeline.
+                 With --precision high/highest, uses jax.default_matmul_precision
+                 context manager to override all matmul precision.
 
-  pipeline      With --precision high/highest, uses jax.default_matmul_precision
-  (high prec)   context manager to override all matmul precision. Comparing
-                DEFAULT vs HIGH shows which stages are matmul-precision dominated.
+  isolated       Each stage independently receives the GPU dump intermediate as
+                 input and calls the production function. Measures per-stage error
+                 without upstream contamination. Single-sequence cases only.
 
 Usage:
     python -m sgl_jax.test.layers.test_kda_precision_analysis --mode matmul-only
-    python -m sgl_jax.test.layers.test_kda_precision_analysis --mode pipeline --layer L22 --dtype fp32
-    python -m sgl_jax.test.layers.test_kda_precision_analysis --mode pipeline --precision high
-    python -m sgl_jax.test.layers.test_kda_precision_analysis --mode pipeline --all-cases
+    python -m sgl_jax.test.layers.test_kda_precision_analysis --mode accumulated --layer L22 --dtype fp32
+    python -m sgl_jax.test.layers.test_kda_precision_analysis --mode accumulated --precision high
+    python -m sgl_jax.test.layers.test_kda_precision_analysis --mode isolated --layer L22 --dtype fp32
 """
 
 from __future__ import annotations
@@ -32,7 +34,15 @@ import jax.lax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.kernels.kda import fused_recurrent_kda
+from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+from sgl_jax.srt.layers.attention.linear.short_convolution import (
+    l2_normalize,
+    short_convolution,
+)
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.test.layers.test_kda_module import (
+    _TEST_MESH,
     _build_extend_env,
     _build_module,
 )
@@ -62,8 +72,8 @@ STAGE_MAP = [
     ("V conv+SiLU",          "v_after_conv",  "intermediates__v_after_conv"),
     ("Gate (fused_kda_gate)", "g",            "intermediates__g"),
     ("Beta (sigmoid)",       "beta",          "intermediates__beta"),
-    ("KDA output",           "o_kda",         "intermediates__o_kda_chunk"),
-    ("Recurrent state",      "recurrent_state", "intermediates__recurrent_state_chunk"),
+    ("KDA output (fused_rec)", "o_kda",         "intermediates__o_kda_fused_recurrent"),
+    ("Recurrent state (fused)", "recurrent_state", "intermediates__recurrent_state_fused_recurrent"),
     ("Output gate (g_out)",  "output_gate",   "intermediates__g_out"),
     ("Output norm",          "o_norm",        "intermediates__o_norm"),
 ]
@@ -272,6 +282,121 @@ def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
 
 
 # ---------------------------------------------------------------------------
+# Mode: isolated (per-stage with GPU dump inputs, single-sequence only)
+# ---------------------------------------------------------------------------
+
+def run_isolated(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: str):
+    """Each stage independently receives GPU dump as input. No upstream error."""
+    case = load_case(layer_dir, case_name)
+    T = int(case["T"])
+
+    if bool(case.get("has_cu_seqlens", False)):
+        print(f"  {case_name}: isolated mode only supports single-sequence cases -- skipped")
+        return []
+
+    module = _build_module(os.path.join(layer_dir, "weights.npz"), dtype)
+    H, D = module.num_heads, module.head_dim
+    proj = H * D
+
+    hidden = jnp.asarray(case["hidden_states"], dtype=dtype)
+    if hidden.ndim == 3:
+        hidden = hidden[0]
+
+    def gpu(key):
+        """Load GPU dump intermediate, squeeze batch dim, cast to dtype."""
+        v = jnp.asarray(case[key], dtype=dtype)
+        return v[0] if v.ndim > hidden.ndim and v.shape[0] == 1 else v
+
+    def gpu_f32(key):
+        """Load GPU dump in float32 (for stages that cast internally)."""
+        v = jnp.asarray(case[key], dtype=jnp.float32)
+        return v[0] if v.ndim > hidden.ndim and v.shape[0] == 1 else v
+
+    ctx = (
+        jax.default_matmul_precision(precision)
+        if precision != "default"
+        else contextlib.nullcontext()
+    )
+
+    rows = []
+    with ctx:
+        # 1. Projections: hidden -> q/k/v
+        for label, proj_fn, key in [
+            ("Q projection", module.q_proj, "intermediates__q_proj"),
+            ("K projection", module.k_proj, "intermediates__k_proj"),
+            ("V projection", module.v_proj, "intermediates__v_proj"),
+        ]:
+            rows.append(compare_stage(label, proj_fn(hidden)[0], case, key))
+
+        # 2. Conv+SiLU: GPU proj -> conv (uses production short_convolution)
+        cache = jnp.zeros((1, proj, module.conv_size), dtype=dtype)
+        cu = jnp.array([0, T], dtype=jnp.int32)
+        for label, conv_w, proj_key, conv_key in [
+            ("Q conv+SiLU", module.q_conv1d.weight.value, "intermediates__q_proj", "intermediates__q_after_conv"),
+            ("K conv+SiLU", module.k_conv1d.weight.value, "intermediates__k_proj", "intermediates__k_after_conv"),
+            ("V conv+SiLU", module.v_conv1d.weight.value, "intermediates__v_proj", "intermediates__v_after_conv"),
+        ]:
+            inp = gpu(proj_key).reshape(T, -1)
+            out, _ = short_convolution(inp, conv_w, cache, cu, ForwardMode.EXTEND, activation=jax.nn.silu)
+            rows.append(compare_stage(label, out.reshape(T, H, D), case, conv_key))
+
+        # 3. Gate: hidden -> f_a_proj -> f_b_proj -> fused_kda_gate
+        raw_gate, _ = module.f_b_proj(module.f_a_proj(hidden)[0])
+        raw_gate = raw_gate.reshape(T, H, D)
+        backend = KDAAttnBackend(mesh=_TEST_MESH)
+        g = backend._fused_kda_gate(module.attn, raw_gate)
+        rows.append(compare_stage("Gate (fused_kda_gate)", g, case, "intermediates__g"))
+
+        # 4. Beta: hidden -> b_proj -> sigmoid
+        beta = jax.nn.sigmoid(module.b_proj(hidden)[0].astype(jnp.float32))
+        rows.append(compare_stage("Beta (sigmoid)", beta, case, "intermediates__beta"))
+
+        # 5. KDA kernel: GPU post-conv + gate + beta -> fused_recurrent_kda
+        kern_q = l2_normalize(gpu("intermediates__q_after_conv").reshape(T, H, D))
+        kern_k = l2_normalize(gpu("intermediates__k_after_conv").reshape(T, H, D))
+        kern_v = gpu("intermediates__v_after_conv").reshape(T, H, D)
+        kern_g = gpu_f32("intermediates__g").reshape(T, H, D)
+        kern_beta = gpu_f32("intermediates__beta")
+        if kern_beta.ndim == 3:
+            kern_beta = kern_beta.reshape(T, H)
+
+        has_init = bool(case.get("has_initial_state", False))
+        init_state = (
+            jnp.asarray(case["initial_recurrent_state"], dtype=jnp.float32)
+            if has_init else jnp.zeros((1, H, D, D), dtype=jnp.float32)
+        )
+        o_rec, s_rec = fused_recurrent_kda(
+            kern_q[None], kern_k[None], kern_v[None],
+            kern_g[None], kern_beta[None],
+            scale=D**-0.5, initial_state=init_state, output_final_state=True,
+        )
+        rows.append(compare_stage("KDA output (fused_rec)", o_rec[0], case, "intermediates__o_kda_fused_recurrent"))
+        rows.append(compare_stage("Recurrent state (fused)", s_rec, case, "intermediates__recurrent_state_fused_recurrent"))
+
+        # 6. Output gate: hidden -> g_a_proj -> g_b_proj
+        g_out, _ = module.g_b_proj(module.g_a_proj(hidden)[0])
+        rows.append(compare_stage("Output gate (g_out)", g_out.reshape(T, H, D), case, "intermediates__g_out"))
+
+        # 7. Output norm: GPU o_kda + GPU g_out -> GatedRMSNorm
+        o_kda_gpu = gpu("intermediates__o_kda_chunk").reshape(T, H, D)
+        g_out_gpu = gpu("intermediates__g_out").reshape(T, H, D)
+        o_norm = module.o_norm(o_kda_gpu, g_out_gpu)
+        rows.append(compare_stage("Output norm", o_norm, case, "intermediates__o_norm"))
+
+        # 8. Final output: GPU o_norm -> o_proj
+        o_norm_gpu = gpu("intermediates__o_norm").reshape(T, proj)
+        final, _ = module.o_proj(o_norm_gpu)
+        out_key = "out_fp32" if dtype == jnp.float32 else "out_bf16"
+        rows.append(compare_stage("Final output (o_proj)", final, case, out_key))
+
+    dtype_label = "fp32" if dtype == jnp.float32 else "bf16"
+    title = f"{case_name} ({dtype_label}, T={T}, precision={precision.upper()}) [ISOLATED]"
+    print_error_table(rows, title)
+    print_distribution_table(rows, title)
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -280,7 +405,7 @@ def main():
         description="KDA per-stage precision analysis (matmul-only / pipeline)"
     )
     parser.add_argument(
-        "--mode", required=True, choices=["matmul-only", "pipeline"],
+        "--mode", required=True, choices=["matmul-only", "accumulated", "isolated"],
         help="Analysis mode",
     )
     parser.add_argument("--layer", default="L22", help="Layer dir (default: L22)")
@@ -306,9 +431,10 @@ def main():
         return
 
     cases = ALL_CASES if args.all_cases else [args.case]
+    run_fn = run_isolated if args.mode == "isolated" else run_pipeline
     for cn in cases:
         try:
-            run_pipeline(layer_dir, cn, dtype, args.precision)
+            run_fn(layer_dir, cn, dtype, args.precision)
         except FileNotFoundError as e:
             print(f"\n  {cn}: {e} -- skipped")
 
