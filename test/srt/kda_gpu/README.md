@@ -1,8 +1,15 @@
 # `kda_gpu/` — KDA GPU Ground-Truth Dumps
 
-H100 reference dumps of `KimiDeltaAttention.forward` for JAX/TPU alignment.
+H100 reference dumps of `KimiDeltaAttention` for JAX/TPU alignment.
 
-Two config profiles:
+Two dump modes:
+
+| Mode | Script | What it dumps | Use case |
+|------|--------|---------------|----------|
+| **Isolated layer** | `dump_weights_KDA.py` + `dump_io_KDAforward.py` | Single KDA layer, 12 synthetic cases | Per-module precision analysis |
+| **Full model** | `dump_full_model_kda.py` | All 20 KDA layers, real activations | End-to-end layer-by-layer alignment |
+
+Two config profiles (isolated mode only):
 
 | Profile | Config | Weights | Output dir | Use case |
 |---------|--------|---------|------------|----------|
@@ -20,28 +27,36 @@ Must run on an **NVIDIA GPU** (H100 recommended) with:
 
 | Package | Version | Why |
 |---|---|---|
-| Python | 3.10 | `fla-core` warns but works |
+| Python | 3.10+ | `fla-core` minimum |
 | `torch` | 2.7.1+cu128 | Driver 535 compatibility |
 | `fla-core` | >= 0.4.0, < 0.5 | KDA kernel implementation |
-| `transformers` | >= 4.55, < 4.57 | `modeling_kimi.py` imports |
+| `transformers` | >= 4.55, < 4.57 | `modeling_kimi.py` imports (5.x incompatible) |
 | `triton` | 3.3.1 | fla dependency |
 | `einops` | >= 0.8 | Tensor reshaping |
 | `safetensors` | any | HF weight loading (real config only) |
+| `flash-attn` | >= 2.8 | MLA layers in full-model mode |
+| `accelerate` | any | `device_map="auto"` for full-model mode |
+| `tiktoken` | any | HF tokenizer for full-model mode |
 
 Install:
 
 ```bash
 pip install 'torch==2.7.1' --index-url https://download.pytorch.org/whl/cu128
 pip install 'fla-core>=0.4.0,<0.5' 'transformers>=4.55,<4.57' einops safetensors
+pip install flash-attn --no-build-isolation  # for full-model mode
+pip install accelerate tiktoken               # for full-model mode
 ```
 
 Also needs `modeling_kimi.py` + `configuration_kimi.py` from
 [moonshotai/Kimi-Linear-48B-A3B-Instruct](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct)
 accessible on `sys.path` (parent dir, `~/kda_repro/`, or alongside this script).
+Isolated-mode scripts only; full-model mode loads them via `trust_remote_code=True`.
 
 ---
 
 ## Quick start
+
+### Isolated layer dumps (12 synthetic cases per layer)
 
 Two scripts, run in order:
 
@@ -54,6 +69,31 @@ python dump_weights_KDA.py --config real --hf-dir /path/to/Kimi-Linear-48B-A3B-I
 python dump_io_KDAforward.py --weights dumps/weights.npz
 python dump_io_KDAforward.py --weights dumps_real/weights.npz
 ```
+
+### Full-model dumps (all 20 KDA layers, real activations)
+
+Single script, loads the entire 48B model and captures KDA intermediates
+at every KDA layer during a real forward pass:
+
+```bash
+python dump_full_model_kda.py \
+  --model-dir /models/Kimi-Linear-48B-A3B-Instruct \
+  --input "the capital of France is" \
+  --output-dir ~/kda_dump/full_model
+```
+
+Requires ~96 GB model weights (bf16); `device_map="auto"` splits across
+GPU (80 GB) and CPU RAM. A single forward pass takes ~10s.
+
+The script monkey-patches `KimiDeltaAttention.forward` to fix the upstream
+line-560 gate bug and capture intermediates at each of the 20 KDA layers.
+Two workarounds are applied automatically:
+- **auto_docstring PEP 604 fix**: `modeling_kimi.py` uses `int | None` unions
+  that crash transformers' `auto_docstring` on Python 3.10. Patched via
+  `sys.modules["transformers.utils.auto_docstring"]._process_parameter_type`.
+- **accelerate hook bypass**: `device_map="auto"` saves the original forward as
+  `module._old_forward` before our patch. We replace `_old_forward` on each
+  KDA instance so the hook calls our capturing forward.
 
 ### `dump_weights_KDA.py`
 
@@ -90,6 +130,16 @@ python dump_weights_KDA.py --config real --hf-dir /path/to/checkpoint --all-kda-
 --weights PATH          Path to weights.npz (required)
 --dumps-dir PATH        Override output directory (default: same dir as weights.npz)
 ```
+
+### `dump_full_model_kda.py`
+
+```
+--model-dir PATH        HF checkpoint directory (default: /models/Kimi-Linear-48B-A3B-Instruct)
+--input TEXT            Input text for forward pass (default: "the capital of France is")
+--output-dir PATH       Output directory (default: ~/kda_dump/full_model/)
+```
+
+Output: `metadata.json` + one `layer_{NN}.npz` per KDA layer (20 files).
 
 ---
 
@@ -167,9 +217,34 @@ Weight keys: `weights__{param_name}` — same names as `module.named_parameters(
 | Intermediates | `intermediates__{q,k,v}_after_conv`, `intermediates__g`, `intermediates__beta`, `intermediates__o_kda_chunk`, `intermediates__recurrent_state_chunk`, `intermediates__o_kda_fused_recurrent`, `intermediates__recurrent_state_fused_recurrent`, `intermediates__g_out`, `intermediates__o_norm` |
 | Outputs | `out_fp32`, `out_bf16` |
 
+**`layer_{NN}.npz`** (full-model mode) — per KDA layer:
+
+| Category | Keys |
+|---|---|
+| Input | `input_hidden_states` [B, T, 2304] — self_attn input (after layernorm) |
+| Projections | `intermediates__q_proj`, `intermediates__k_proj`, `intermediates__v_proj` [B, T, 4096] |
+| Post-conv | `intermediates__q_after_conv`, `intermediates__k_after_conv`, `intermediates__v_after_conv` [B, T, 32, 128] |
+| Gate | `intermediates__g` [B, T, 32, 128] fp32, `intermediates__beta` [B, T, 32] fp32 |
+| Kernel | `intermediates__o_kda` [B, T, 32, 128], `intermediates__recurrent_state` [N, 32, 128, 128] |
+| Output stages | `intermediates__g_out` [B, T, 32, 128], `intermediates__o_norm` [B, T, 32, 128] |
+| Final output | `output` [B, T, 2304] — after o_proj |
+| Metadata | `mode_used` — `"chunk"` or `"fused_recurrent"` |
+
+**`metadata.json`** (full-model mode) — run metadata:
+
+| Field | Example |
+|---|---|
+| `input_text` | `"the capital of France is"` |
+| `input_ids` | `[2108, 10484, 318, 15383, 387]` |
+| `num_tokens` | `5` |
+| `kda_layer_indices` | `[0, 1, 2, 4, 5, 6, ...]` (20 layers, 0-based) |
+| `env` | torch/cuda/transformers/fla versions, device, timestamp |
+
 ---
 
 ## Pre-generated dumps (GCS)
+
+### Isolated layer dumps
 
 Real-config dumps (HF weights, 4 KDA layers evenly spaced) are on GCS:
 
@@ -197,7 +272,26 @@ gs://model-storage-sglang/yuhao/kimi-linear/kda_module/
 All 4 layers: **12/12 cases passed** (chunk vs fused_recurrent max abs diff < 1e-3).
 Total: ~2.2 GiB across 4 layers.
 
-On GCE VMs with GCS FUSE mount, access at `/models/yuhao/kimi-linear/kda_module/`.
+### Full-model dumps
+
+All 20 KDA layers, captured during a single forward pass with real activations:
+
+```
+gs://model-storage-sglang/yuhao/kimi-linear/kda_full_model_dump/
+├── metadata.json
+├── layer_00.npz          ~2.9 MiB
+├── layer_01.npz
+├── layer_02.npz
+│   ... (20 KDA layers: 0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25)
+├── layer_24.npz
+└── layer_25.npz
+```
+
+Input: `"the capital of France is"` (5 tokens). Total: ~58 MiB.
+
+### GCS FUSE mount
+
+On GCE VMs with GCS FUSE mount, access at `/models/yuhao/kimi-linear/`.
 
 ---
 
@@ -217,7 +311,8 @@ The dumps produced here are consumed by JAX/TPU alignment tests:
 
 | Test | Path | Purpose |
 |------|------|---------|
-| Phase B alignment | `python/sgl_jax/test/layers/test_kda_backend.py` | End-to-end prefill + decode vs GPU reference |
+| Phase B alignment | `python/sgl_jax/test/layers/test_kda_backend.py` | End-to-end prefill + decode vs GPU reference (isolated dumps) |
 | Precision analysis | `python/sgl_jax/test/layers/test_kda_precision_analysis.py` | Per-stage error isolation and matmul precision comparison |
+| Full-model sanity | `python/sgl_jax/test/layers/test_kda_full_model.py` | Shape/NaN checks on full-model dumps |
 
 Evaluation report: `docs/evaluations/kda-numerical-alignment.md`

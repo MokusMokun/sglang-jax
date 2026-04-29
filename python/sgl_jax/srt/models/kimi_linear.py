@@ -258,16 +258,24 @@ class KimiDeltaAttention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         recurrent_state_pool,
+        intermediates: dict | None = None,
     ) -> tuple[jax.Array, object]:
         del positions
 
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
+        if intermediates is not None:
+            intermediates["q_proj"] = q
+            intermediates["k_proj"] = k
+            intermediates["v_proj"] = v
 
         raw_gate, _ = self.f_b_proj(self.f_a_proj(hidden_states)[0])
         raw_gate = raw_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
         beta = jax.nn.sigmoid(self.b_proj(hidden_states)[0].astype(jnp.float32))
+        if intermediates is not None:
+            intermediates["raw_gate"] = raw_gate
+            intermediates["beta"] = beta
 
         o, recurrent_state_pool = self.attn(
             forward_batch,
@@ -277,13 +285,20 @@ class KimiDeltaAttention(nnx.Module):
             raw_gate,
             beta,
             recurrent_state_pool,
+            intermediates=intermediates,
         )
         o = o.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
+        if intermediates is not None:
+            intermediates["o_kda"] = o
 
         g_a, _ = self.g_a_proj(hidden_states)
         output_gate, _ = self.g_b_proj(g_a)
         output_gate = output_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
+        if intermediates is not None:
+            intermediates["output_gate"] = output_gate
         o = self.o_norm(o, output_gate).reshape(hidden_states.shape[0], self.projection_size)
+        if intermediates is not None:
+            intermediates["o_norm"] = o
         o, _ = self.o_proj(o)
 
         return o, recurrent_state_pool
