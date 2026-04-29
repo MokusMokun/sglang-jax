@@ -1,9 +1,7 @@
 """
-dump_weights_KDA.py — Extract KDA module weights into weights.npz.
+dump_weights_KDA.py — Extract KDA module weights from HF safetensors.
 
-Two modes:
-  --config small   Random init (hidden=128, heads=4, head_dim=32)
-  --config real    Real weights from HF safetensors (hidden=2304, heads=32, head_dim=128)
+Loads real weights from moonshotai/Kimi-Linear-48B-A3B-Instruct checkpoint.
 
 Supports single or multiple layers:
   --layer-idx 0              Single layer → weights.npz
@@ -22,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -39,42 +36,17 @@ from fixed_kda_module import FixedKimiDeltaAttention  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Config profiles
+# Config (real HF values from moonshotai/Kimi-Linear-48B-A3B-Instruct)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ConfigProfile:
-    name: str
-    hidden_size: int
-    num_heads: int
-    head_dim: int
-    conv_size: int
-    rms_norm_eps: float
-    seed: int
-
-
-SMALL_CONFIG = ConfigProfile(
-    name="small",
-    hidden_size=128,
-    num_heads=4,
-    head_dim=32,
-    conv_size=4,
-    rms_norm_eps=1e-6,
-    seed=0,
-)
-
-# Real HF config from moonshotai/Kimi-Linear-48B-A3B-Instruct config.json.
 # hidden_size=2304 is the model hidden dim; projection_size =
 # num_heads * head_dim = 32 * 128 = 4096.
-REAL_CONFIG = ConfigProfile(
-    name="real",
-    hidden_size=2304,
-    num_heads=32,
-    head_dim=128,
-    conv_size=4,
-    rms_norm_eps=1e-5,
-    seed=0,
-)
+HIDDEN_SIZE = 2304
+NUM_HEADS = 32
+HEAD_DIM = 128
+CONV_SIZE = 4
+RMS_NORM_EPS = 1e-5
+SEED = 0
 
 
 # ---------------------------------------------------------------------------
@@ -95,25 +67,25 @@ def env_snapshot() -> dict:
         "modeling_kimi_md5": "337ae1fc58c7010db4051e30fa23563e",
         "fix_note": (
             "modeling_kimi.py:560 fused_kda_gate(g, A_log, dt_bias=dt_bias) "
-            "with g.view(B,T,H,D) reshape -- see kda_gpu/DESIGN.md"
+            "with g.view(B,T,H,D) reshape"
         ),
     }
 
 
-def _build_config(profile: ConfigProfile):
+def _build_config():
     from configuration_kimi import KimiLinearConfig
     return KimiLinearConfig(
-        hidden_size=profile.hidden_size,
-        num_attention_heads=profile.num_heads,
-        intermediate_size=4 * profile.hidden_size,
+        hidden_size=HIDDEN_SIZE,
+        num_attention_heads=NUM_HEADS,
+        intermediate_size=4 * HIDDEN_SIZE,
         num_hidden_layers=1,
-        rms_norm_eps=profile.rms_norm_eps,
+        rms_norm_eps=RMS_NORM_EPS,
         linear_attn_config=dict(
             kda_layers=[1],
             full_attn_layers=[],
-            head_dim=profile.head_dim,
-            num_heads=profile.num_heads,
-            short_conv_kernel_size=profile.conv_size,
+            head_dim=HEAD_DIM,
+            num_heads=NUM_HEADS,
+            short_conv_kernel_size=CONV_SIZE,
         ),
         vocab_size=1000,
     )
@@ -208,36 +180,12 @@ def _load_hf_weights(
         print(f"  WARNING: HF params not in module: {unexpected}")
 
 
-def _build_module(
-    profile: ConfigProfile,
-    hf_dir: str | None = None,
-    layer_idx: int = 0,
-) -> FixedKimiDeltaAttention:
-    """Build fp32 module with weights loaded."""
-    cfg = _build_config(profile)
-    seed = profile.seed
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    torch.manual_seed(seed)
-
+def _build_module(hf_dir: str, layer_idx: int = 0) -> FixedKimiDeltaAttention:
+    """Build fp32 module with HF weights loaded."""
+    cfg = _build_config()
+    torch.manual_seed(SEED)
     m = FixedKimiDeltaAttention(cfg, layer_idx=0).cuda()
-
-    if profile.name == "real" and hf_dir is not None:
-        _load_hf_weights(m, hf_dir, layer_idx=layer_idx)
-    else:
-        with torch.no_grad():
-            for name, p in m.named_parameters():
-                if name == "A_log":
-                    continue
-                if name == "dt_bias":
-                    p.zero_()
-                    continue
-                if p.dtype.is_floating_point:
-                    tmp = torch.empty(p.shape, device="cpu")
-                    tmp.normal_(mean=0.0, std=0.02, generator=g)
-                    p.copy_(tmp.to(p.device))
-            if hasattr(m, "o_norm") and hasattr(m.o_norm, "weight"):
-                m.o_norm.weight.fill_(1.0)
-
+    _load_hf_weights(m, hf_dir, layer_idx=layer_idx)
     m.eval()
     return m
 
@@ -247,23 +195,21 @@ def _t2np(t: torch.Tensor) -> np.ndarray:
 
 
 def _dump_one_layer(
-    profile: ConfigProfile,
     layer_idx: int,
     out_path: Path,
-    hf_dir: str | None = None,
+    hf_dir: str,
 ) -> None:
     """Dump weights for a single layer to out_path."""
     print(f"\n--- layer {layer_idx} ---")
-    m = _build_module(profile, hf_dir=hf_dir, layer_idx=layer_idx)
+    m = _build_module(hf_dir, layer_idx=layer_idx)
 
     payload: dict = {
-        "config__profile": np.asarray(profile.name),
-        "config__hidden_size": np.asarray(profile.hidden_size),
-        "config__num_heads": np.asarray(profile.num_heads),
-        "config__head_dim": np.asarray(profile.head_dim),
-        "config__conv_size": np.asarray(profile.conv_size),
-        "config__rms_norm_eps": np.asarray(profile.rms_norm_eps),
-        "config__seed": np.asarray(profile.seed),
+        "config__hidden_size": np.asarray(HIDDEN_SIZE),
+        "config__num_heads": np.asarray(NUM_HEADS),
+        "config__head_dim": np.asarray(HEAD_DIM),
+        "config__conv_size": np.asarray(CONV_SIZE),
+        "config__rms_norm_eps": np.asarray(RMS_NORM_EPS),
+        "config__seed": np.asarray(SEED),
         "config__layer_idx": np.asarray(layer_idx),
     }
     for k, v in env_snapshot().items():
@@ -290,15 +236,11 @@ def _dump_one_layer(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract KDA module weights into weights.npz"
+        description="Extract KDA module weights from HF safetensors"
     )
     parser.add_argument(
-        "--config", choices=["small", "real"], default="small",
-        help="Config profile (default: small).",
-    )
-    parser.add_argument(
-        "--hf-dir", type=str, default=None,
-        help="HF checkpoint directory (required for --config real).",
+        "--hf-dir", type=str, required=True,
+        help="HF checkpoint directory containing model.safetensors.index.json.",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -309,18 +251,13 @@ def parse_args() -> argparse.Namespace:
     )
     group.add_argument(
         "--all-kda-layers", action="store_true",
-        help="Dump all KDA layers (reads kda_layers from config.json). "
-             "Requires --hf-dir.",
+        help="Dump all KDA layers (reads kda_layers from config.json).",
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,
-        help="Output directory. Default: dumps/ (small) or dumps_real/ (real).",
+        help="Output directory. Default: dumps/",
     )
     args = parser.parse_args()
-    if args.config == "real" and args.hf_dir is None:
-        parser.error("--hf-dir is required when --config real")
-    if args.all_kda_layers and args.hf_dir is None:
-        parser.error("--all-kda-layers requires --hf-dir")
     if args.layer_idx is None and not args.all_kda_layers:
         args.layer_idx = [0]
     return args
@@ -328,12 +265,8 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    profile = REAL_CONFIG if args.config == "real" else SMALL_CONFIG
 
-    if args.output_dir:
-        dumps_dir = Path(args.output_dir)
-    else:
-        dumps_dir = HERE / ("dumps_real" if args.config == "real" else "dumps")
+    dumps_dir = Path(args.output_dir) if args.output_dir else HERE / "dumps"
     dumps_dir.mkdir(exist_ok=True, parents=True)
 
     assert torch.cuda.is_available(), "This script expects a CUDA device"
@@ -341,17 +274,13 @@ def main():
     # Resolve layer indices
     if args.all_kda_layers:
         layer_indices = _get_kda_layer_indices(args.hf_dir)
-        print(f"=== dump_weights_KDA: config={profile.name}, "
-              f"all KDA layers ({len(layer_indices)}) ===")
+        print(f"=== dump_weights_KDA: all KDA layers ({len(layer_indices)}) ===")
     else:
         layer_indices = args.layer_idx
-        print(f"=== dump_weights_KDA: config={profile.name}, "
-              f"layer(s)={layer_indices} ===")
+        print(f"=== dump_weights_KDA: layer(s)={layer_indices} ===")
 
-    print(f"  hidden_size={profile.hidden_size}  num_heads={profile.num_heads}  "
-          f"head_dim={profile.head_dim}")
-    if args.config == "real":
-        print(f"  hf_dir={args.hf_dir}")
+    print(f"  hidden_size={HIDDEN_SIZE}  num_heads={NUM_HEADS}  head_dim={HEAD_DIM}")
+    print(f"  hf_dir={args.hf_dir}")
     print(f"  output_dir={dumps_dir}")
 
     # Dump each layer
@@ -361,7 +290,7 @@ def main():
             out_path = dumps_dir / "weights.npz"
         else:
             out_path = dumps_dir / f"weights_L{layer_idx}.npz"
-        _dump_one_layer(profile, layer_idx, out_path, hf_dir=args.hf_dir)
+        _dump_one_layer(layer_idx, out_path, hf_dir=args.hf_dir)
 
     print(f"\nDone: {len(layer_indices)} layer(s) dumped to {dumps_dir}")
 
