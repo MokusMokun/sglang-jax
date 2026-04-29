@@ -9,13 +9,10 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.kernels.kda import chunk_kda, fused_recurrent_kda
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
-<<<<<<< HEAD
 )
 from sgl_jax.srt.layers.attention.linear.short_convolution import (
     l2_normalize,
     short_convolution,
-=======
->>>>>>> 883eb1b4 (fix(kda): address PR #970 review — interface alignment and cleanup)
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -27,21 +24,11 @@ if TYPE_CHECKING:
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
-<<<<<<< HEAD
     def __init__(self, mesh: jax.sharding.Mesh = None, use_pallas_prefill: bool = False):
         super().__init__(
             mesh=mesh,
         )
         self.use_pallas_prefill = use_pallas_prefill
-=======
-    use_pallas_prefill = False
->>>>>>> 883eb1b4 (fix(kda): address PR #970 review — interface alignment and cleanup)
-
-    def __init__(self, runner):
-        super().__init__(
-            mesh=runner.mesh,
-            req_to_token_pool=runner.req_to_token_pool,
-        )
 
     def __call__(
         self,

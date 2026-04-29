@@ -24,7 +24,6 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackendMetadata,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
@@ -65,15 +64,8 @@ class LinearRecurrentAttnBackend(AttentionBackend):
     def __init__(
         self,
         mesh: jax.sharding.Mesh | None = None,
-<<<<<<< HEAD
     ):
         self.mesh = mesh
-=======
-        req_to_token_pool=None,
-    ):
-        self.mesh = mesh
-        self.req_to_token_pool = req_to_token_pool
->>>>>>> 883eb1b4 (fix(kda): address PR #970 review — interface alignment and cleanup)
         self.forward_metadata = nnx.data(LinearRecurrentAttnBackendMetadata())
 
     def get_forward_metadata(
@@ -96,7 +88,6 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-<<<<<<< HEAD
         # put array to devices
         (
             metadata.cu_q_lens,
@@ -106,52 +97,16 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
 
-=======
-        if self.req_to_token_pool is not None:
-            recurrent_indices = np.asarray(
-                self.req_to_token_pool.get_linear_recurrent_indices(
-                    batch.req_pool_indices
-                ),
-                dtype=np.int32,
-            )
-        else:
-            recurrent_indices = np.arange(len(batch.seq_lens), dtype=np.int32)
-        sharding = (
-            NamedSharding(self.mesh, P())
-            if self.mesh is not None and jax.process_count() == 1
-            else None
-        )
-        cu_q_lens_dev, recurrent_indices_dev = device_array(
-            (cu_q_lens, recurrent_indices),
-            sharding=sharding,
-        )
-        metadata = LinearRecurrentAttnBackendMetadata(
-            cu_q_lens=cu_q_lens_dev,
-            recurrent_indices=recurrent_indices_dev,
-        )
-        self.forward_metadata = nnx.data(metadata)
->>>>>>> 883eb1b4 (fix(kda): address PR #970 review — interface alignment and cleanup)
         return metadata
 
     def tree_flatten(self):
         children = (self.forward_metadata,)
-<<<<<<< HEAD
         aux_data = {}
-=======
-        aux_data = {"mesh": self.mesh, "req_to_token_pool": self.req_to_token_pool}
->>>>>>> 883eb1b4 (fix(kda): address PR #970 review — interface alignment and cleanup)
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-<<<<<<< HEAD
         obj = cls()
-=======
-        obj = cls(
-            mesh=aux_data["mesh"],
-            req_to_token_pool=aux_data.get("req_to_token_pool"),
-        )
->>>>>>> 883eb1b4 (fix(kda): address PR #970 review — interface alignment and cleanup)
         obj.forward_metadata = children[0]
         return obj
 
@@ -159,7 +114,6 @@ class LinearRecurrentAttnBackend(AttentionBackend):
     def get_layer_cache(recurrent_state_pool, layer_id: int):
         """Returns (recurrent_cache, conv_cache) for the given layer.
 
-<<<<<<< HEAD
         Matches RecurrentStatePool.get_linear_recurrent_layer_cache (PR #966)
         which returns a (recurrent, conv) tuple.
         """
@@ -169,33 +123,6 @@ class LinearRecurrentAttnBackend(AttentionBackend):
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
         # hack setting to 1024, because linear attention backend has no limitation
         return 1024
-=======
-    @staticmethod
-    def _get_layer_cache(recurrent_state_pool, layer_id: int):
-        """Returns (recurrent_cache, conv_cache) for the given layer.
-
-        Matches RecurrentStatePool.get_linear_recurrent_layer_cache (PR #966)
-        which returns a (recurrent, conv) tuple.
-        """
-        layer_cache = recurrent_state_pool.get_linear_recurrent_layer_cache(layer_id)
-        if isinstance(layer_cache, tuple) and len(layer_cache) == 2:
-            return layer_cache
-        raise TypeError(
-            "linear recurrent layer cache must be a (recurrent, conv) tuple"
-        )
-
-    @staticmethod
-    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
-        # Same scalar-prefetch budget heuristic as FlashAttention: metadata
-        # arrays (cu_q_lens, recurrent_indices) must fit in TPU scalar-prefetch
-        # memory.
-        num_page_per_req = cdiv(max_context_len, page_size)
-        res = 1024 * 1024 // 2 // num_page_per_req // 4
-        assert (
-            res > 0
-        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
-        return res
->>>>>>> 883eb1b4 (fix(kda): address PR #970 review — interface alignment and cleanup)
 
 
 # --- HybridLinearAttnBackend -----------------------------------------------
@@ -349,13 +276,7 @@ class MockRecurrentStatePool:
         )
         self.layer_caches = {} if layer_caches is None else dict(layer_caches)
 
-<<<<<<< HEAD
     def get_linear_recurrent_indices(self, req_pool_indices: np.ndarray) -> np.ndarray:
-=======
-    def get_linear_recurrent_indices(
-        self, req_pool_indices: np.ndarray
-    ) -> np.ndarray:
->>>>>>> 883eb1b4 (fix(kda): address PR #970 review — interface alignment and cleanup)
         """Identity mapping — slot i maps to recurrent index i."""
         return np.asarray(req_pool_indices, dtype=np.int32)
 
