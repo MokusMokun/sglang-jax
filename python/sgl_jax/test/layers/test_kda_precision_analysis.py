@@ -54,6 +54,9 @@ from sgl_jax.test.layers.test_kda_module import (
 DUMP_BASE = os.environ.get(
     "KDA_DUMP_DIR", "/models/yuhao/kimi-linear/kda_module"
 )
+FULL_MODEL_DUMP_DIR = os.environ.get(
+    "KDA_FULL_MODEL_DUMP_DIR", "/models/yuhao/kimi-linear/kda_full_model_dump"
+)
 
 ALL_CASES = [
     "single_T1", "single_T8", "single_T64", "single_T65",
@@ -62,8 +65,8 @@ ALL_CASES = [
     "single_T128_initstate", "varlen_initstate",
 ]
 
-# Captured key -> GPU dump key(s)
-STAGE_MAP = [
+# Captured key -> GPU dump key (isolated dumps)
+STAGE_MAP_ISOLATED = [
     ("Q projection",         "q_proj",        "intermediates__q_proj"),
     ("K projection",         "k_proj",        "intermediates__k_proj"),
     ("V projection",         "v_proj",        "intermediates__v_proj"),
@@ -72,8 +75,24 @@ STAGE_MAP = [
     ("V conv+SiLU",          "v_after_conv",  "intermediates__v_after_conv"),
     ("Gate (fused_kda_gate)", "g",            "intermediates__g"),
     ("Beta (sigmoid)",       "beta",          "intermediates__beta"),
-    ("KDA output (fused_rec)", "o_kda",         "intermediates__o_kda_fused_recurrent"),
+    ("KDA output (fused_rec)", "o_kda",       "intermediates__o_kda_fused_recurrent"),
     ("Recurrent state (fused)", "recurrent_state", "intermediates__recurrent_state_fused_recurrent"),
+    ("Output gate (g_out)",  "output_gate",   "intermediates__g_out"),
+    ("Output norm",          "o_norm",        "intermediates__o_norm"),
+]
+
+# Captured key -> GPU dump key (full-model dumps)
+STAGE_MAP_FULL_MODEL = [
+    ("Q projection",         "q_proj",        "intermediates__q_proj"),
+    ("K projection",         "k_proj",        "intermediates__k_proj"),
+    ("V projection",         "v_proj",        "intermediates__v_proj"),
+    ("Q conv+SiLU",          "q_after_conv",  "intermediates__q_after_conv"),
+    ("K conv+SiLU",          "k_after_conv",  "intermediates__k_after_conv"),
+    ("V conv+SiLU",          "v_after_conv",  "intermediates__v_after_conv"),
+    ("Gate (fused_kda_gate)", "g",            "intermediates__g"),
+    ("Beta (sigmoid)",       "beta",          "intermediates__beta"),
+    ("KDA output (fused_rec)", "o_kda",       "intermediates__o_kda"),
+    ("Recurrent state (fused)", "recurrent_state", "intermediates__recurrent_state"),
     ("Output gate (g_out)",  "output_gate",   "intermediates__g_out"),
     ("Output norm",          "o_norm",        "intermediates__o_norm"),
 ]
@@ -88,6 +107,33 @@ def load_case(layer_dir: str, case_name: str) -> dict:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Case not found: {path}")
     return dict(np.load(path, allow_pickle=True))
+
+
+def load_full_model_layer(layer_idx: int) -> dict:
+    """Load full-model dump and normalize keys to match isolated dump format."""
+    path = os.path.join(FULL_MODEL_DUMP_DIR, f"layer_{layer_idx:02d}.npz")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Full-model dump not found: {path}")
+    raw = dict(np.load(path, allow_pickle=True))
+    # Normalize keys: input_hidden_states -> hidden_states, output -> out_fp32
+    case = {}
+    for k, v in raw.items():
+        case[k] = v
+    case["hidden_states"] = raw["input_hidden_states"]
+    case["out_fp32"] = raw["output"]
+    case["T"] = raw["input_hidden_states"].shape[1]
+    case["has_initial_state"] = False
+    case["has_cu_seqlens"] = False
+    return case
+
+
+# Layer name -> 0-based layer index for full-model dumps
+_LAYER_NAME_TO_IDX = {
+    "L0": 0, "L1": 1, "L2": 2, "L4": 4, "L5": 5, "L6": 6,
+    "L8": 8, "L9": 9, "L10": 10, "L12": 12, "L13": 13, "L14": 14,
+    "L16": 16, "L17": 17, "L18": 18, "L20": 20, "L21": 21, "L22": 22,
+    "L24": 24, "L25": 25,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +274,17 @@ def run_matmul_only(layer_dir: str, dtype: jnp.dtype):
 # Mode: pipeline (production forward with intermediates capture)
 # ---------------------------------------------------------------------------
 
-def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: str):
+def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: str,
+                 source: str = "isolated"):
     """Run production KimiDeltaAttention.__call__ with intermediates capture."""
-    case = load_case(layer_dir, case_name)
+    layer_name = os.path.basename(layer_dir)
+    if source == "full-model":
+        layer_idx = _LAYER_NAME_TO_IDX[layer_name]
+        case = load_full_model_layer(layer_idx)
+        stage_map = STAGE_MAP_FULL_MODEL
+    else:
+        case = load_case(layer_dir, case_name)
+        stage_map = STAGE_MAP_ISOLATED
     T = int(case["T"])
 
     module = _build_module(os.path.join(layer_dir, "weights.npz"), dtype)
@@ -263,7 +317,7 @@ def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
 
     # Build comparison rows
     rows = []
-    for label, cap_key, dump_key in STAGE_MAP:
+    for label, cap_key, dump_key in stage_map:
         if cap_key in intermediates:
             rows.append(compare_stage(label, intermediates[cap_key], case, dump_key))
         else:
@@ -285,9 +339,21 @@ def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
 # Mode: isolated (per-stage with GPU dump inputs, single-sequence only)
 # ---------------------------------------------------------------------------
 
-def run_isolated(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: str):
+def run_isolated(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: str,
+                 source: str = "isolated"):
     """Each stage independently receives GPU dump as input. No upstream error."""
-    case = load_case(layer_dir, case_name)
+    layer_name = os.path.basename(layer_dir)
+    if source == "full-model":
+        layer_idx = _LAYER_NAME_TO_IDX[layer_name]
+        case = load_full_model_layer(layer_idx)
+        o_kda_key = "intermediates__o_kda"
+        recurrent_key = "intermediates__recurrent_state"
+        out_key = "out_fp32"
+    else:
+        case = load_case(layer_dir, case_name)
+        o_kda_key = "intermediates__o_kda_fused_recurrent"
+        recurrent_key = "intermediates__recurrent_state_fused_recurrent"
+        out_key = "out_fp32" if dtype == jnp.float32 else "out_bf16"
     T = int(case["T"])
 
     if bool(case.get("has_cu_seqlens", False)):
@@ -370,15 +436,16 @@ def run_isolated(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
             kern_g[None], kern_beta[None],
             scale=D**-0.5, initial_state=init_state, output_final_state=True,
         )
-        rows.append(compare_stage("KDA output (fused_rec)", o_rec[0], case, "intermediates__o_kda_fused_recurrent"))
-        rows.append(compare_stage("Recurrent state (fused)", s_rec, case, "intermediates__recurrent_state_fused_recurrent"))
+        rows.append(compare_stage("KDA output (fused_rec)", o_rec[0], case, o_kda_key))
+        rows.append(compare_stage("Recurrent state (fused)", s_rec, case, recurrent_key))
 
         # 6. Output gate: hidden -> g_a_proj -> g_b_proj
         g_out, _ = module.g_b_proj(module.g_a_proj(hidden)[0])
         rows.append(compare_stage("Output gate (g_out)", g_out.reshape(T, H, D), case, "intermediates__g_out"))
 
         # 7. Output norm: GPU o_kda + GPU g_out -> GatedRMSNorm
-        o_kda_gpu = gpu("intermediates__o_kda_chunk").reshape(T, H, D)
+        o_kda_dump_key = "intermediates__o_kda" if source == "full-model" else "intermediates__o_kda_chunk"
+        o_kda_gpu = gpu(o_kda_dump_key).reshape(T, H, D)
         g_out_gpu = gpu("intermediates__g_out").reshape(T, H, D)
         o_norm = module.o_norm(o_kda_gpu, g_out_gpu)
         rows.append(compare_stage("Output norm", o_norm, case, "intermediates__o_norm"))
@@ -386,7 +453,6 @@ def run_isolated(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
         # 8. Final output: GPU o_norm -> o_proj
         o_norm_gpu = gpu("intermediates__o_norm").reshape(T, proj)
         final, _ = module.o_proj(o_norm_gpu)
-        out_key = "out_fp32" if dtype == jnp.float32 else "out_bf16"
         rows.append(compare_stage("Final output (o_proj)", final, case, out_key))
 
     dtype_label = "fp32" if dtype == jnp.float32 else "bf16"
@@ -417,6 +483,10 @@ def main():
         help="Matmul precision override (pipeline mode only)",
     )
     parser.add_argument("--all-cases", action="store_true", help="Sweep all 12 cases")
+    parser.add_argument(
+        "--source", default="isolated", choices=["isolated", "full-model"],
+        help="Dump source: isolated layer dumps or full-model dumps",
+    )
     args = parser.parse_args()
 
     layer_dir = os.path.join(DUMP_BASE, args.layer)
@@ -430,13 +500,21 @@ def main():
         run_matmul_only(layer_dir, dtype)
         return
 
-    cases = ALL_CASES if args.all_cases else [args.case]
-    run_fn = run_isolated if args.mode == "isolated" else run_pipeline
-    for cn in cases:
-        try:
-            run_fn(layer_dir, cn, dtype, args.precision)
-        except FileNotFoundError as e:
-            print(f"\n  {cn}: {e} -- skipped")
+    if args.source == "full-model":
+        if args.layer not in _LAYER_NAME_TO_IDX:
+            print(f"ERROR: {args.layer} not a valid KDA layer for full-model dumps")
+            sys.exit(1)
+        # Full-model has a single case per layer, ignore --case and --all-cases
+        run_fn = run_isolated if args.mode == "isolated" else run_pipeline
+        run_fn(layer_dir, "full_model", dtype, args.precision, source="full-model")
+    else:
+        cases = ALL_CASES if args.all_cases else [args.case]
+        run_fn = run_isolated if args.mode == "isolated" else run_pipeline
+        for cn in cases:
+            try:
+                run_fn(layer_dir, cn, dtype, args.precision, source="isolated")
+            except FileNotFoundError as e:
+                print(f"\n  {cn}: {e} -- skipped")
 
 
 if __name__ == "__main__":
