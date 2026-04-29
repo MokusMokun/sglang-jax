@@ -5,8 +5,7 @@ Reads weights.npz (produced by dump_weights_KDA.py) to rebuild the module,
 then runs each case through chunk + fused_recurrent + bf16 paths.
 
 Usage:
-  python dump_io_KDAforward.py --weights dumps/weights.npz
-  python dump_io_KDAforward.py --weights dumps_real/weights.npz
+  python dump_io_KDAforward.py --weights /path/to/L0/weights.npz
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ for cand in (HERE.parent, HERE / "..", Path.home() / "kda_repro"):
     if (p / "configuration_kimi.py").exists():
         sys.path.insert(0, str(p))
 
-from fixed_kda_module import FixedKimiDeltaAttention  # noqa: E402
+from hf_kda_module import FixedKimiDeltaAttention  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +124,7 @@ def env_snapshot() -> dict:
         "modeling_kimi_md5": "337ae1fc58c7010db4051e30fa23563e",
         "fix_note": (
             "modeling_kimi.py:560 fused_kda_gate(g, A_log, dt_bias=dt_bias) "
-            "with g.view(B,T,H,D) reshape -- see kda_gpu/DESIGN.md"
+            "with g.view(B,T,H,D) reshape"
         ),
     }
 
@@ -251,7 +250,8 @@ def run_case(
     if init_state is not None:
         payload["initial_recurrent_state"] = _t2np(init_state)
 
-    for k in ("q_after_conv", "k_after_conv", "v_after_conv", "g", "beta",
+    for k in ("q_proj", "k_proj", "v_proj",
+              "q_after_conv", "k_after_conv", "v_after_conv", "g", "beta",
               "g_out", "o_norm"):
         payload[f"intermediates__{k}"] = _t2np(inter_chunk[k])
     payload["intermediates__o_kda_chunk"] = _t2np(inter_chunk["o_kda"])
@@ -333,7 +333,7 @@ def main():
     args = parse_args()
     weights_path = Path(args.weights)
     if not weights_path.exists():
-        print(f"ERROR: {weights_path} not found. Run dump_weights.py first.")
+        print(f"ERROR: {weights_path} not found. Run dump_weights_KDA.py first.")
         sys.exit(1)
 
     if args.dumps_dir:

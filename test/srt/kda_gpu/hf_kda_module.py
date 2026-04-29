@@ -1,5 +1,7 @@
 """
-fixed_kda_module.py — Subclass of HuggingFace KimiDeltaAttention that
+hf_kda_module.py — Subclass of HuggingFace KimiDeltaAttention that
+
+Reference: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/main/modeling_kimi.py
 
   1. Fixes the upstream bug at modeling_kimi.py:560
         g = fused_kda_gate(g, self.A_log, self.head_dim, g_bias=self.dt_bias)
@@ -140,26 +142,23 @@ class FixedKimiDeltaAttention(KimiDeltaAttention):  # type: ignore[misc, valid-t
         B, T, _ = hidden_states.shape
         H, D = self.num_heads, self.head_dim
 
-        # 1) projections + 2) short causal conv + silu, mirroring upstream lines 541-558.
-        # We pass cu_seqlens through the conv layer the same way upstream does;
-        # we do NOT pass a cache (output_final_state=False).
+        # 1) projections
+        q_proj_out = self.q_proj(hidden_states)         # [B, T, proj_size]
+        k_proj_out = self.k_proj(hidden_states)
+        v_proj_out = self.v_proj(hidden_states)
+
+        # 2) short causal conv + silu, mirroring upstream lines 541-558.
         q, _ = self.q_conv1d(
-            x=self.q_proj(hidden_states),
-            cache=None,
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
+            x=q_proj_out, cache=None,
+            output_final_state=False, cu_seqlens=cu_seqlens,
         )
         k, _ = self.k_conv1d(
-            x=self.k_proj(hidden_states),
-            cache=None,
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
+            x=k_proj_out, cache=None,
+            output_final_state=False, cu_seqlens=cu_seqlens,
         )
         v, _ = self.v_conv1d(
-            x=self.v_proj(hidden_states),
-            cache=None,
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
+            x=v_proj_out, cache=None,
+            output_final_state=False, cu_seqlens=cu_seqlens,
         )
 
         # 3) reshape into heads (and capture as q/k/v_after_conv)
@@ -227,7 +226,10 @@ class FixedKimiDeltaAttention(KimiDeltaAttention):  # type: ignore[misc, valid-t
             return out
 
         intermediates = {
-            "q_after_conv": q4,                        # [B, T, H, D]   fp/bf
+            "q_proj": q_proj_out,                        # [B, T, proj_size] pre-conv
+            "k_proj": k_proj_out,
+            "v_proj": v_proj_out,
+            "q_after_conv": q4,                          # [B, T, H, D]   post-conv+silu
             "k_after_conv": k4,
             "v_after_conv": v4,
             "g": g,                                     # [B, T, H, D]   fp32

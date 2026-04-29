@@ -10,8 +10,7 @@ Two config profiles:
 | `real` | 2304h / 32H / 128d | HF safetensors | `dumps_real/` | Numerical alignment |
 
 > **Upstream bug**: `modeling_kimi.py:560` has a broken `fused_kda_gate` call.
-> We subclass `KimiDeltaAttention` in `fixed_kda_module.py` to fix it.
-> See `DESIGN.md` for details.
+> We subclass `KimiDeltaAttention` in `hf_kda_module.py` to fix it.
 
 ---
 
@@ -204,8 +203,21 @@ On GCE VMs with GCS FUSE mount, access at `/models/yuhao/kimi-linear/kda_module/
 
 ## Caveats
 
-1. `modeling_kimi.py:560` is broken upstream — `fixed_kda_module.py` works around it
+1. `modeling_kimi.py:560` is broken upstream — `hf_kda_module.py` works around it
 2. No backward / gradient dumps
 3. No incremental decode / cache passing — single forward only
 4. `fused_recurrent` may OOM at large T — flagged via `fused_recurrent_skipped`
 5. chunk vs fused_recurrent are not bit-equal (~1e-4 to 1e-3 in fp32)
+
+---
+
+## TPU Alignment Tests
+
+The dumps produced here are consumed by JAX/TPU alignment tests:
+
+| Test | Path | Purpose |
+|------|------|---------|
+| Phase B alignment | `python/sgl_jax/test/layers/test_kda_backend.py` | End-to-end prefill + decode vs GPU reference |
+| Precision analysis | `python/sgl_jax/test/layers/test_kda_precision_analysis.py` | Per-stage error isolation and matmul precision comparison |
+
+Evaluation report: `docs/evaluations/kda-numerical-alignment.md`
