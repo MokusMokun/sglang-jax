@@ -1,6 +1,6 @@
 # KDA Phase B: Numerical Alignment
 
-**Updated**: 2026-04-28 | **Branch**: `sub3/layer-tests`
+**Updated**: 2026-04-29 | **Branch**: `merge/kda-validation`
 
 | Item | Value |
 |------|-------|
@@ -36,21 +36,25 @@ Matmul of all results below use `Precision.DEFAULT` (single-pass bf16 matmul on 
 
 ### Cross-Layer (Prefill)
 
-| Layer | FP32 worst | BF16 worst | Tier |
-|-------|-----------|-----------|------|
-| L0 | 1.29e-03 | 1.95e-03 | tight |
-| L6 | 1.47e-02 | 2.34e-02 | loose |
-| L13 | 1.36e-02 | 1.56e-02 | loose |
-| L22 | 2.70e-02 | 6.25e-02 | loose |
+Worst case across all 12 cases per layer. `max_abs` and `mean_abs` are from the same worst-case case.
+
+| Layer | FP32 max_abs | FP32 mean_abs | BF16 max_abs | BF16 mean_abs | Tier | Worst case |
+|-------|-------------|--------------|-------------|--------------|------|------------|
+| L0 | 1.29e-03 | 7.99e-05 | 2.20e-03 | 1.04e-04 | tight | varlen_initstate / single_T128_initstate |
+| L6 | 1.44e-02 | 4.83e-04 | 3.12e-02 | 8.14e-04 | loose | single_T1024 |
+| L13 | 1.91e-02 | 9.63e-04 | 3.12e-02 | 1.55e-03 | loose | varlen_balanced_4x32 / single_T1024 |
+| L22 | 2.84e-02 | 1.94e-03 | 6.25e-02 | 3.39e-03 | loose | single_T1024 |
 
 ### Cross-Layer (Decode)
 
-| Layer | FP32 worst | BF16 worst |
-|-------|-----------|-----------|
-| L0 | < 1e-3 | < 2e-3 |
-| L6 | 2.13e-03 | 3.91e-03 |
-| L13 | 2.80e-03 | 3.91e-03 |
-| L22 | 5.26e-03 | 1.56e-02 |
+Worst case across 3 decode cases per layer.
+
+| Layer | FP32 max_abs | FP32 mean_abs | BF16 max_abs | BF16 mean_abs |
+|-------|-------------|--------------|-------------|--------------|
+| L0 | 2.61e-04 | 4.56e-05 | 7.32e-04 | 1.30e-04 |
+| L6 | 2.66e-03 | 3.70e-04 | 5.86e-03 | 1.04e-03 |
+| L13 | 3.22e-03 | 6.98e-04 | 8.79e-03 | 1.89e-03 |
+| L22 | 5.12e-03 | 1.11e-03 | 1.56e-02 | 2.43e-03 |
 
 ### Overall
 
@@ -62,7 +66,7 @@ Matmul of all results below use `Precision.DEFAULT` (single-pass bf16 matmul on 
 | L22 | 28 | 2 | 0 | 28 |
 | **Total** | **112** | **8** | **28** | **84** |
 
-Error grows ~20x L0→L22 (prefill), ~4x (decode) — deeper layers have larger weight magnitudes, amplifying cross-device matmul precision differences. Decode error is smaller (single token, no sequence accumulation).
+Error grows ~20x L0→L22 (prefill), ~20x (decode) — deeper layers have larger weight magnitudes, amplifying cross-device matmul precision differences. Decode error is smaller (single token, no sequence accumulation).
 
 ---
 
@@ -152,7 +156,6 @@ Single matmul `hidden_states [128, 2304] @ q_proj_w [2304, 4096]` on L22, GPU du
 FP32 inputs: `HIGH` improves ~300×, `HIGHEST` ~3000× (near fp32 machine epsilon), confirming pipeline correctness. BF16 inputs: no change — `precision` only affects fp32→bf16 truncation in the multiplier; bf16 inputs are already at native MXU precision, so these results represent the production precision floor.
 
 Script: `test/layers/test_kda_precision_analysis.py --mode matmul-only`.
-Relavant Material: https://docs.jax.dev/en/latest/jax.lax.html#jax.lax.Precision
 
 ### Cumulative Error (DEFAULT vs HIGH)
 
@@ -196,93 +199,177 @@ Pallas's main advantage is varlen packed scenarios (parallel chunk processing vs
 
 **FP32** (11 passed, 1 skipped):
 
-| Case | max_abs | mean_abs | Kernel |
-|------|---------|----------|--------|
-| single_T1 | — | — | SKIP |
-| single_T8 | 6.36e-04 | 5.33e-05 | naive |
-| single_T64 | 7.09e-04 | 5.85e-05 | naive |
-| single_T65 | 7.10e-04 | 5.84e-05 | pallas |
-| single_T128 | 7.10e-04 | 5.89e-05 | pallas |
-| single_T256 | 8.45e-04 | 5.86e-05 | pallas |
-| single_T1024 | 9.47e-04 | 5.90e-05 | pallas |
-| varlen_balanced_4x32 | 7.26e-04 | 5.76e-05 | naive |
-| varlen_unbalanced | 6.98e-04 | 5.75e-05 | naive |
-| varlen_single_T128 | 7.10e-04 | 5.89e-05 | pallas |
-| single_T128_initstate | 7.61e-04 | 6.03e-05 | pallas |
-| varlen_initstate | 1.29e-03 | 7.99e-05 | pallas |
+| Case | max_abs | mean_abs |
+|------|---------|----------|
+| single_T1 | — | SKIP |
+| single_T8 | 6.16e-04 | 5.32e-05 |
+| single_T64 | 7.04e-04 | 5.84e-05 |
+| single_T65 | 7.07e-04 | 5.83e-05 |
+| single_T128 | 7.07e-04 | 5.88e-05 |
+| single_T256 | 8.36e-04 | 5.83e-05 |
+| single_T1024 | 9.50e-04 | 5.87e-05 |
+| varlen_balanced_4x32 | 9.57e-04 | 6.56e-05 |
+| varlen_unbalanced | 9.48e-04 | 6.52e-05 |
+| varlen_single_T128 | 7.07e-04 | 5.88e-05 |
+| single_T128_initstate | 7.81e-04 | 6.00e-05 |
+| varlen_initstate | 1.29e-03 | 7.99e-05 |
 
-**BF16** (11 passed, 1 skipped): max_abs clusters at 9.77e-04 (= 1/1024, bf16 ULP near 1.0). Recurrence upcasts to fp32 internally, so bf16 truncation only affects projection/conv.
+**BF16** (11 passed, 1 skipped):
 
-| Case | max_abs | mean_abs | Kernel |
-|------|---------|----------|--------|
-| single_T1 | — | — | SKIP |
-| single_T8 | 4.88e-04 | 5.95e-05 | naive |
-| single_T64 | 9.77e-04 | 6.16e-05 | naive |
-| single_T65 | 9.77e-04 | 6.16e-05 | pallas |
-| single_T128 | 9.77e-04 | 6.39e-05 | pallas |
-| single_T256 | 9.77e-04 | 6.55e-05 | pallas |
-| single_T1024 | 9.77e-04 | 6.81e-05 | pallas |
-| varlen_balanced_4x32 | 9.77e-04 | 6.74e-05 | naive |
-| varlen_unbalanced | 9.77e-04 | 6.69e-05 | naive |
-| varlen_single_T128 | 9.77e-04 | 6.39e-05 | pallas |
-| single_T128_initstate | 1.46e-03 | 6.73e-05 | pallas |
-| varlen_initstate | 1.95e-03 | 8.87e-05 | pallas |
+| Case | max_abs | mean_abs |
+|------|---------|----------|
+| single_T1 | — | SKIP |
+| single_T8 | 7.32e-04 | 9.46e-05 |
+| single_T64 | 9.77e-04 | 9.56e-05 |
+| single_T65 | 9.77e-04 | 9.63e-05 |
+| single_T128 | 1.10e-03 | 1.01e-04 |
+| single_T256 | 1.22e-03 | 1.01e-04 |
+| single_T1024 | 1.95e-03 | 1.04e-04 |
+| varlen_balanced_4x32 | 1.59e-03 | 1.01e-04 |
+| varlen_unbalanced | 1.46e-03 | 1.02e-04 |
+| varlen_single_T128 | 1.10e-03 | 1.01e-04 |
+| single_T128_initstate | 2.20e-03 | 1.04e-04 |
+| varlen_initstate | 1.46e-03 | 1.21e-04 |
 
 **Decode** (6 passed, all tight):
 
-| Case | FP32 max_abs | BF16 max_abs |
-|------|-------------|-------------|
-| single_T8 | < 1e-3 | < 2e-3 |
-| single_T128 | < 1e-3 | < 2e-3 |
-| single_T128_initstate | < 1e-3 | < 2e-3 |
+| Case | FP32 max_abs | FP32 mean_abs | BF16 max_abs | BF16 mean_abs |
+|------|-------------|--------------|-------------|--------------|
+| single_T8 | 1.45e-04 | 3.28e-05 | 4.88e-04 | 9.31e-05 |
+| single_T128 | 2.57e-04 | 4.57e-05 | 7.32e-04 | 1.30e-04 |
+| single_T128_initstate | 2.61e-04 | 4.56e-05 | 7.32e-04 | 1.29e-04 |
 
 ### L22 — Worst Case (all loose)
 
 **FP32** (11 passed, 1 skipped):
 
-| Case | max_abs | mean_abs | Kernel |
-|------|---------|----------|--------|
-| single_T1 | — | — | SKIP |
-| single_T8 | 8.96e-03 | 1.40e-03 | naive |
-| single_T64 | 1.78e-02 | 1.85e-03 | naive |
-| single_T65 | 1.78e-02 | 1.84e-03 | pallas |
-| single_T128 | 1.78e-02 | 1.86e-03 | pallas |
-| single_T256 | 2.42e-02 | 1.91e-03 | pallas |
-| single_T1024 | 2.70e-02 | 1.94e-03 | pallas |
-| varlen_balanced_4x32 | 1.81e-02 | 1.80e-03 | naive |
-| varlen_unbalanced | 1.66e-02 | 1.80e-03 | naive |
-| varlen_single_T128 | 1.78e-02 | 1.86e-03 | pallas |
-| single_T128_initstate | 2.41e-02 | 1.88e-03 | pallas |
-| varlen_initstate | 2.39e-02 | 2.17e-03 | pallas |
+| Case | max_abs | mean_abs |
+|------|---------|----------|
+| single_T1 | — | SKIP |
+| single_T8 | 8.94e-03 | 1.40e-03 |
+| single_T64 | 1.72e-02 | 1.84e-03 |
+| single_T65 | 1.73e-02 | 1.83e-03 |
+| single_T128 | 1.73e-02 | 1.86e-03 |
+| single_T256 | 2.39e-02 | 1.91e-03 |
+| single_T1024 | 2.84e-02 | 1.94e-03 |
+| varlen_balanced_4x32 | 2.23e-02 | 2.07e-03 |
+| varlen_unbalanced | 2.30e-02 | 2.07e-03 |
+| varlen_single_T128 | 1.73e-02 | 1.86e-03 |
+| single_T128_initstate | 2.41e-02 | 1.88e-03 |
+| varlen_initstate | 2.39e-02 | 2.17e-03 |
 
 **BF16** (11 passed, 1 skipped):
 
-| Case | max_abs | mean_abs | Kernel |
-|------|---------|----------|--------|
-| single_T1 | — | — | SKIP |
-| single_T8 | 1.17e-02 | 1.54e-03 | naive |
-| single_T64 | 3.13e-02 | 1.99e-03 | naive |
-| single_T65 | 3.13e-02 | 1.99e-03 | pallas |
-| single_T128 | 3.13e-02 | 2.07e-03 | pallas |
-| single_T256 | 3.13e-02 | 2.11e-03 | pallas |
-| single_T1024 | 6.25e-02 | 2.12e-03 | pallas |
-| varlen_balanced_4x32 | 3.13e-02 | 2.25e-03 | naive |
-| varlen_unbalanced | 3.13e-02 | 2.25e-03 | naive |
-| varlen_single_T128 | 3.13e-02 | 2.07e-03 | pallas |
-| single_T128_initstate | 2.34e-02 | 2.12e-03 | pallas |
-| varlen_initstate | 3.13e-02 | 2.43e-03 | pallas |
+| Case | max_abs | mean_abs |
+|------|---------|----------|
+| single_T1 | — | SKIP |
+| single_T8 | 3.12e-02 | 2.50e-03 |
+| single_T64 | 4.69e-02 | 3.16e-03 |
+| single_T65 | 4.69e-02 | 3.14e-03 |
+| single_T128 | 4.69e-02 | 3.30e-03 |
+| single_T256 | 4.69e-02 | 3.36e-03 |
+| single_T1024 | 6.25e-02 | 3.39e-03 |
+| varlen_balanced_4x32 | 4.69e-02 | 3.34e-03 |
+| varlen_unbalanced | 4.69e-02 | 3.34e-03 |
+| varlen_single_T128 | 4.69e-02 | 3.30e-03 |
+| single_T128_initstate | 4.69e-02 | 3.34e-03 |
+| varlen_initstate | 4.69e-02 | 3.39e-03 |
 
 **Decode** (6 passed, all loose):
 
-| Case | FP32 max_abs | BF16 max_abs |
-|------|-------------|-------------|
-| single_T8 | 4.78e-03 | 1.17e-02 |
-| single_T128 | 5.26e-03 | 1.56e-02 |
-| single_T128_initstate | 5.26e-03 | 1.56e-02 |
+| Case | FP32 max_abs | FP32 mean_abs | BF16 max_abs | BF16 mean_abs |
+|------|-------------|--------------|-------------|--------------|
+| single_T8 | 4.81e-03 | 1.01e-03 | 1.37e-02 | 2.68e-03 |
+| single_T128 | 5.12e-03 | 1.11e-03 | 1.56e-02 | 2.43e-03 |
+| single_T128_initstate | 5.12e-03 | 1.11e-03 | 1.56e-02 | 2.43e-03 |
 
-### L6, L13
+### L6
 
-All 28 non-skip tests pass at loose tolerance. Per-case tables omitted — see cross-layer summary for worst-case numbers. Full data in `test_kda_backend.py` test output.
+**FP32** (11 passed, 1 skipped):
+
+| Case | max_abs | mean_abs |
+|------|---------|----------|
+| single_T1 | — | SKIP |
+| single_T8 | 5.33e-03 | 4.03e-04 |
+| single_T64 | 6.85e-03 | 4.88e-04 |
+| single_T65 | 6.88e-03 | 4.88e-04 |
+| single_T128 | 8.79e-03 | 4.83e-04 |
+| single_T256 | 9.89e-03 | 4.86e-04 |
+| single_T1024 | 1.44e-02 | 4.83e-04 |
+| varlen_balanced_4x32 | 1.16e-02 | 5.28e-04 |
+| varlen_unbalanced | 1.16e-02 | 5.27e-04 |
+| varlen_single_T128 | 8.79e-03 | 4.83e-04 |
+| single_T128_initstate | 1.02e-02 | 5.05e-04 |
+| varlen_initstate | 1.33e-02 | 6.91e-04 |
+
+**BF16** (11 passed, 1 skipped):
+
+| Case | max_abs | mean_abs |
+|------|---------|----------|
+| single_T1 | — | SKIP |
+| single_T8 | 7.81e-03 | 6.84e-04 |
+| single_T64 | 1.76e-02 | 8.16e-04 |
+| single_T65 | 1.76e-02 | 8.17e-04 |
+| single_T128 | 1.95e-02 | 8.17e-04 |
+| single_T256 | 3.12e-02 | 8.18e-04 |
+| single_T1024 | 3.12e-02 | 8.14e-04 |
+| varlen_balanced_4x32 | 1.56e-02 | 8.24e-04 |
+| varlen_unbalanced | 1.56e-02 | 8.27e-04 |
+| varlen_single_T128 | 1.95e-02 | 8.16e-04 |
+| single_T128_initstate | 1.95e-02 | 8.46e-04 |
+| varlen_initstate | 2.34e-02 | 1.04e-03 |
+
+**Decode** (6 passed, all loose):
+
+| Case | FP32 max_abs | FP32 mean_abs | BF16 max_abs | BF16 mean_abs |
+|------|-------------|--------------|-------------|--------------|
+| single_T8 | 2.66e-03 | 3.70e-04 | 3.91e-03 | 7.72e-04 |
+| single_T128 | 2.34e-03 | 4.25e-04 | 5.86e-03 | 1.03e-03 |
+| single_T128_initstate | 2.36e-03 | 4.25e-04 | 5.86e-03 | 1.04e-03 |
+
+### L13
+
+**FP32** (11 passed, 1 skipped):
+
+| Case | max_abs | mean_abs |
+|------|---------|----------|
+| single_T1 | — | SKIP |
+| single_T8 | 6.93e-03 | 7.97e-04 |
+| single_T64 | 8.76e-03 | 8.72e-04 |
+| single_T65 | 8.77e-03 | 8.73e-04 |
+| single_T128 | 1.32e-02 | 8.57e-04 |
+| single_T256 | 1.31e-02 | 8.86e-04 |
+| single_T1024 | 1.32e-02 | 8.90e-04 |
+| varlen_balanced_4x32 | 1.91e-02 | 9.63e-04 |
+| varlen_unbalanced | 1.91e-02 | 9.70e-04 |
+| varlen_single_T128 | 1.32e-02 | 8.57e-04 |
+| single_T128_initstate | 1.32e-02 | 8.87e-04 |
+| varlen_initstate | 1.25e-02 | 1.17e-03 |
+
+**BF16** (11 passed, 1 skipped):
+
+| Case | max_abs | mean_abs |
+|------|---------|----------|
+| single_T1 | — | SKIP |
+| single_T8 | 8.79e-03 | 1.47e-03 |
+| single_T64 | 1.56e-02 | 1.49e-03 |
+| single_T65 | 1.56e-02 | 1.49e-03 |
+| single_T128 | 1.56e-02 | 1.51e-03 |
+| single_T256 | 1.56e-02 | 1.53e-03 |
+| single_T1024 | 3.12e-02 | 1.55e-03 |
+| varlen_balanced_4x32 | 2.34e-02 | 1.53e-03 |
+| varlen_unbalanced | 2.34e-02 | 1.54e-03 |
+| varlen_single_T128 | 1.56e-02 | 1.51e-03 |
+| single_T128_initstate | 1.56e-02 | 1.55e-03 |
+| varlen_initstate | 1.60e-02 | 1.75e-03 |
+
+**Decode** (6 passed, all loose):
+
+| Case | FP32 max_abs | FP32 mean_abs | BF16 max_abs | BF16 mean_abs |
+|------|-------------|--------------|-------------|--------------|
+| single_T8 | 2.20e-03 | 5.21e-04 | 5.86e-03 | 1.24e-03 |
+| single_T128 | 3.22e-03 | 6.98e-04 | 8.79e-03 | 1.89e-03 |
+| single_T128_initstate | 3.22e-03 | 6.98e-04 | 8.79e-03 | 1.89e-03 |
 
 ---
 
@@ -290,3 +377,4 @@ All 28 non-skip tests pass at loose tolerance. Per-case tables omitted — see c
 
 - **T=1 skip**: GPU chunk kernel outputs all zeros for T < chunk_size (64). TPU naive kernel correctly produces non-zero output. Test verifies no NaN + non-zero, then skips comparison.
 - **GPU chunk vs fused_recurrent baseline**: Even on GPU the two kernels differ — attention output max_abs_diff = 1.21e-04, recurrent state = 6.33e-04. This sets a floor for cross-kernel comparison.
+- **Test script**: `test/layers/test_kda_module.py` — black-box module-level test at `KimiDeltaAttention.__call__` boundary. Run with `KDA_DUMP_LAYER=L0 python -m pytest ... -v -s` to see per-case metrics.
