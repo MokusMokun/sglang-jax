@@ -62,7 +62,6 @@ class RadixLinearAttention(nnx.Module):
         a: jax.Array,
         b: jax.Array,
         recurrent_state_pool,
-        intermediates: dict | None = None,
     ):
         output, recurrent_state_pool = forward_batch.attn_backend(
             q=q,
@@ -70,9 +69,8 @@ class RadixLinearAttention(nnx.Module):
             v=v,
             layer=self,
             forward_batch=forward_batch,
-            recurrent_state_pool=recurrent_state_pool,
+            pool=recurrent_state_pool,
             a=a,
             b=b,
-            intermediates=intermediates,
         )
         return output, recurrent_state_pool

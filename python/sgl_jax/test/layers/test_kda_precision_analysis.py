@@ -19,6 +19,7 @@ Usage:
     python -m sgl_jax.test.layers.test_kda_precision_analysis --mode matmul-only
     python -m sgl_jax.test.layers.test_kda_precision_analysis --mode accumulated --layer L22 --dtype fp32
     python -m sgl_jax.test.layers.test_kda_precision_analysis --mode accumulated --precision high
+    python -m sgl_jax.test.layers.test_kda_precision_analysis --mode accumulated --kernel pallas
     python -m sgl_jax.test.layers.test_kda_precision_analysis --mode isolated --layer L22 --dtype fp32
 """
 
@@ -34,7 +35,7 @@ import jax.lax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.kernels.kda import fused_recurrent_kda
+from sgl_jax.srt.kernels.kda import chunk_kda, fused_recurrent_kda
 from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sgl_jax.srt.layers.attention.linear.short_convolution import (
     l2_normalize,
@@ -275,7 +276,7 @@ def run_matmul_only(layer_dir: str, dtype: jnp.dtype):
 # ---------------------------------------------------------------------------
 
 def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: str,
-                 source: str = "isolated"):
+                 source: str = "isolated", kernel: str = "naive"):
     """Run production KimiDeltaAttention.__call__ with intermediates capture."""
     layer_name = os.path.basename(layer_dir)
     if source == "full-model":
@@ -305,6 +306,8 @@ def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
     )
 
     fb, pool = _build_extend_env(module, T, init_state, cu_seqlens)
+    if kernel == "pallas":
+        fb.attn_backend.use_pallas_prefill = True
 
     intermediates = {}
     ctx = (
@@ -329,7 +332,8 @@ def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
 
     dtype_label = "fp32" if dtype == jnp.float32 else "bf16"
     N = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else 1
-    title = f"{case_name} ({dtype_label}, T={T}, N={N}, precision={precision.upper()})"
+    kernel_label = "pallas" if kernel == "pallas" else "naive"
+    title = f"{case_name} ({dtype_label}, T={T}, N={N}, precision={precision.upper()}, kernel={kernel_label})"
     print_error_table(rows, title)
     print_distribution_table(rows, title)
     return rows
@@ -439,6 +443,25 @@ def run_isolated(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
         rows.append(compare_stage("KDA output (fused_rec)", o_rec[0], case, o_kda_key))
         rows.append(compare_stage("Recurrent state (fused)", s_rec, case, recurrent_key))
 
+        # 5b. Pallas chunk_kda: same GPU post-conv inputs -> chunk_kda
+        # Pallas kernels don't support Precision.HIGH/HIGHEST, so always run at DEFAULT.
+        chunk_o_key = "intermediates__o_kda" if source == "full-model" else "intermediates__o_kda_chunk"
+        chunk_s_key = "intermediates__recurrent_state" if source == "full-model" else "intermediates__recurrent_state_chunk"
+        chunk_cu = jnp.array([0, T], dtype=jnp.int32)
+        with jax.default_matmul_precision("default"):
+            o_chunk, s_chunk, *_ = chunk_kda(
+                kern_q[None], kern_k[None], kern_v[None],
+                kern_g[None],
+                kern_beta[None],
+                scale=D**-0.5,
+                initial_state=init_state,
+                output_final_state=True,
+                cu_seqlens=chunk_cu,
+                use_gate_in_kernel=False,
+            )
+        rows.append(compare_stage("KDA output (chunk)", o_chunk[0], case, chunk_o_key))
+        rows.append(compare_stage("Recurrent state (chunk)", s_chunk, case, chunk_s_key))
+
         # 6. Output gate: hidden -> g_a_proj -> g_b_proj
         g_out, _ = module.g_b_proj(module.g_a_proj(hidden)[0])
         rows.append(compare_stage("Output gate (g_out)", g_out.reshape(T, H, D), case, "intermediates__g_out"))
@@ -487,6 +510,10 @@ def main():
         "--source", default="isolated", choices=["isolated", "full-model"],
         help="Dump source: isolated layer dumps or full-model dumps",
     )
+    parser.add_argument(
+        "--kernel", default="naive", choices=["naive", "pallas"],
+        help="Kernel for accumulated mode: naive (fused_recurrent) or pallas (chunk_kda)",
+    )
     args = parser.parse_args()
 
     layer_dir = os.path.join(DUMP_BASE, args.layer)
@@ -505,16 +532,26 @@ def main():
             print(f"ERROR: {args.layer} not a valid KDA layer for full-model dumps")
             sys.exit(1)
         # Full-model has a single case per layer, ignore --case and --all-cases
-        run_fn = run_isolated if args.mode == "isolated" else run_pipeline
-        run_fn(layer_dir, "full_model", dtype, args.precision, source="full-model")
+        if args.mode == "isolated":
+            run_isolated(layer_dir, "full_model", dtype, args.precision, source="full-model")
+        else:
+            run_pipeline(layer_dir, "full_model", dtype, args.precision,
+                         source="full-model", kernel=args.kernel)
     else:
         cases = ALL_CASES if args.all_cases else [args.case]
-        run_fn = run_isolated if args.mode == "isolated" else run_pipeline
-        for cn in cases:
-            try:
-                run_fn(layer_dir, cn, dtype, args.precision, source="isolated")
-            except FileNotFoundError as e:
-                print(f"\n  {cn}: {e} -- skipped")
+        if args.mode == "isolated":
+            for cn in cases:
+                try:
+                    run_isolated(layer_dir, cn, dtype, args.precision, source="isolated")
+                except FileNotFoundError as e:
+                    print(f"\n  {cn}: {e} -- skipped")
+        else:
+            for cn in cases:
+                try:
+                    run_pipeline(layer_dir, cn, dtype, args.precision,
+                                 source="isolated", kernel=args.kernel)
+                except FileNotFoundError as e:
+                    print(f"\n  {cn}: {e} -- skipped")
 
 
 if __name__ == "__main__":

@@ -75,6 +75,8 @@ Each stage receives the **GPU dump intermediate** as input, isolating that stage
 | Beta (sigmoid) | hidden_states | 6.79e-04 | 1.73e-04 | 6.79e-04 | 1.73e-04 |
 | KDA output (fused_rec) | GPU post-conv + g + beta | 1.06e-04 | 5.64e-07 | 1.06e-04 | 5.64e-07 |
 | Recurrent state (fused) | GPU post-conv + g + beta | 3.86e-05 | 6.57e-09 | 3.86e-05 | 6.57e-09 |
+| KDA output (chunk) | GPU post-conv + g + beta | 1.06e-04 | 6.02e-07 | 1.06e-04 | 6.02e-07 |
+| Recurrent state (chunk) | GPU post-conv + g + beta | 1.07e-03 | 2.89e-06 | 1.07e-03 | 2.89e-06 |
 | Output gate (g_out) | hidden_states | <u>3.00e-02</u> | <u>1.84e-03</u> | 2.86e-02 | 2.69e-03 |
 | Output norm | GPU o_kda + GPU g_out | 7.21e-03 | 5.14e-05 | 7.21e-03 | 5.14e-05 |
 | Final output (o_proj) | GPU o_norm | 5.13e-02 | 3.82e-04 | 5.13e-02 | 3.82e-04 |
