@@ -97,11 +97,14 @@ def _set_param(module, attr_path: str, value: np.ndarray) -> None:
 def _build_module(
     weights_path: str,
     dtype: jnp.dtype = jnp.float32,
+    mesh: jax.sharding.Mesh | None = None,
 ) -> KimiDeltaAttention:
     """Construct a KimiDeltaAttention and load GPU reference weights."""
+    if mesh is None:
+        mesh = _TEST_MESH
     weights = dict(np.load(weights_path, allow_pickle=True))
     config = _make_config(weights)
-    module = KimiDeltaAttention(config, layer_idx=0, mesh=_TEST_MESH, dtype=dtype)
+    module = KimiDeltaAttention(config, layer_idx=0, mesh=mesh, dtype=dtype)
 
     num_heads = config.linear_attn_config["num_heads"]
 
@@ -143,8 +146,11 @@ def _build_extend_env(
     T: int,
     init_state: jax.Array | None = None,
     cu_seqlens: jax.Array | None = None,
+    mesh: jax.sharding.Mesh | None = None,
 ) -> tuple[ForwardBatch, RecurrentStatePool]:
     """Build EXTEND ForwardBatch + RecurrentStatePool for one or more sequences."""
+    if mesh is None:
+        mesh = _TEST_MESH
     if cu_seqlens is None:
         cu_seqlens = jnp.array([0, T], dtype=jnp.int32)
     N = cu_seqlens.shape[0] - 1
@@ -156,7 +162,7 @@ def _build_extend_env(
         num_heads=module.num_heads,
         head_dim=module.head_dim,
         conv_kernel_size=module.conv_size,
-        mesh=_TEST_MESH,
+        mesh=mesh,
     )
     if init_state is not None:
         pool.recurrent_buffers[0] = pool.recurrent_buffers[0].at[1 : N + 1].set(
@@ -166,7 +172,7 @@ def _build_extend_env(
     # Pool slots start at 1 (slot 0 is dummy).
     recurrent_indices = jnp.arange(1, N + 1, dtype=jnp.int32)
 
-    backend = KDAAttnBackend(mesh=_TEST_MESH)
+    backend = KDAAttnBackend(mesh=mesh)
     backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
         cu_q_lens=cu_seqlens,
         recurrent_indices=recurrent_indices,

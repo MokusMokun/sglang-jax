@@ -1,6 +1,6 @@
 # KDA Phase B: Numerical Alignment
 
-**Updated**: 2026-04-29 | **Branch**: `merge/kda-validation`
+**Updated**: 2026-04-30 | **Branch**: `merge/kda-validation`
 
 | Item | Value |
 |------|-------|
@@ -55,13 +55,76 @@ Error grows monotonically with depth: mean_abs rises ~40× from L0 (5e-5) to L25
 
 ## Error Source Analysis
 
-Per-stage analysis on **L22, full-model dump** (T=5, real activations from `"the capital of France is"`). **Isolated**: each stage independently receives GPU dump as input. **Accumulated**: production forward pass. Script: `test/layers/test_kda_precision_analysis.py --source full-model`.
+Per-stage analysis on **full-model dump** (T=5, real activations from `"the capital of France is"`). Production dtype is **bf16**. Script: `test/layers/test_kda_precision_analysis.py --source full-model`.
 
-### Per-Stage Isolated Error (Full-Model, L22)
+### Per-Stage Isolated Error (BF16, L22 / L24 / L25)
 
-Each stage receives the **GPU dump intermediate** as input, isolating that stage's own JAX-vs-GPU error. Script: `--mode isolated --source full-model`.
+Each stage independently receives the **GPU dump intermediate** as input, isolating that stage's own JAX-vs-GPU error. Script: `--mode isolated --source full-model --dtype bf16`.
 
-**L22, full_model, FP32 — DEFAULT vs HIGH**
+| Stage | Input source | L22 max | L22 mean | L24 max | L24 mean | L25 max | L25 mean |
+|-------|-------------|---------|----------|---------|----------|---------|----------|
+| Q projection | hidden_states | 1.56e-02 | 2.43e-06 | <u>7.81e-03</u> | 1.65e-06 | 7.81e-03 | 6.14e-07 |
+| K projection | hidden_states | 1.56e-02 | 4.03e-06 | 7.81e-03 | 8.27e-07 | 3.91e-03 | 7.69e-07 |
+| V projection | hidden_states | 1.56e-02 | 4.59e-06 | 3.91e-03 | 5.43e-07 | 7.81e-03 | 1.45e-06 |
+| Q conv+SiLU | GPU q_proj | <u>3.12e-02</u> | <u>1.02e-04</u> | <u>3.12e-02</u> | <u>8.25e-05</u> | <u>1.56e-02</u> | <u>4.02e-05</u> |
+| K conv+SiLU | GPU k_proj | <u>3.12e-02</u> | <u>8.53e-05</u> | <u>1.56e-02</u> | <u>5.16e-05</u> | <u>7.81e-03</u> | <u>2.69e-05</u> |
+| V conv+SiLU | GPU v_proj | <u>3.12e-02</u> | <u>9.51e-05</u> | <u>1.56e-02</u> | <u>6.83e-05</u> | <u>7.81e-03</u> | <u>5.04e-05</u> |
+| Gate (fused_kda_gate) | hidden_states | **1.22e-01** | **1.71e-03** | **3.05e-01** | **3.03e-03** | **3.50e-01** | **3.13e-03** |
+| Beta (sigmoid) | hidden_states | 8.41e-04 | 5.28e-06 | 1.19e-07 | 2.98e-08 | 5.96e-08 | 3.13e-08 |
+| KDA output (fused_rec) | GPU post-conv + g + beta | 2.44e-04 | 6.76e-07 | 4.88e-04 | 5.15e-07 | 6.10e-05 | 5.82e-07 |
+| Recurrent state (fused) | GPU post-conv + g + beta | 5.55e-03 | 9.09e-06 | 3.54e-03 | 6.49e-06 | 3.71e-03 | 4.53e-06 |
+| KDA output (chunk) | GPU post-conv + g + beta | 4.88e-04 | 1.01e-06 | 2.44e-04 | 9.31e-07 | 1.22e-04 | 1.07e-06 |
+| Recurrent state (chunk) | GPU post-conv + g + beta | <u>1.76e-02</u> | <u>1.41e-05</u> | 4.95e-03 | <u>9.87e-06</u> | 5.53e-03 | <u>7.10e-06</u> |
+| Output gate (g_out) | hidden_states | 3.81e-06 | 1.86e-10 | 9.77e-04 | 5.07e-08 | 0 | 0 |
+| Output norm | GPU o_kda + GPU g_out | 0 | 0 | 0 | 0 | 0 | 0 |
+| Final output (o_proj) | GPU o_norm | 9.77e-04 | 2.13e-07 | 1.95e-03 | 4.29e-07 | <u>7.81e-03</u> | 8.94e-07 |
+
+BF16 characteristics:
+- **Projections**: max_abs = bf16 quantization step (1.56e-02 = 2⁻⁶ or 7.81e-03 = 2⁻⁷), mean_abs ~1000× smaller than FP32 — bf16 inputs are bit-identical on both devices, only rounding at the bf16 boundary differs.
+- **Gate**: dominant error source across all layers. L24 is worst (3.05e-01) due to larger exp(A_log) amplification. Gate range spans `[-264, 0]` at L24 vs `[-80, 0]` at L22.
+- **Kernel output**: fused_rec ≈ chunk in max_abs (same order of magnitude). Both near bit-exact.
+- **Recurrent state**: chunk ~2-3× worse than fused (chunked state accumulation algorithm differs). L22 chunk state (1.76e-02) is the worst across all layers — this error accumulates into every subsequent decode step.
+- **Output gate / output norm**: many stages show exact zero error — bf16 inputs are identical on both devices.
+
+### Per-Stage Accumulated Error (BF16, L22)
+
+Production `KimiDeltaAttention.__call__` with `intermediates` capture. Script: `--mode accumulated --source full-model --dtype bf16`.
+
+**L22, full_model, BF16 — Naive (fused_recurrent)**
+
+| Stage | max_abs | mean_abs |
+|-------|---------|----------|
+| Q projection | 1.56e-02 | 2.43e-06 |
+| K projection | 1.56e-02 | 4.03e-06 |
+| V projection | 1.56e-02 | 4.59e-06 |
+| Q conv+SiLU | 3.12e-02 | 1.02e-04 |
+| K conv+SiLU | 3.12e-02 | 8.64e-05 |
+| V conv+SiLU | 3.12e-02 | 9.53e-05 |
+| Gate (fused_kda_gate) | **1.22e-01** | **1.71e-03** |
+| Beta (sigmoid) | 8.41e-04 | 5.28e-06 |
+| KDA output (fused_rec) | 4.88e-04 | 1.54e-06 |
+| Recurrent state (fused) | <u>2.03e-02</u> | 2.16e-05 |
+| Output gate (g_out) | 3.81e-06 | 1.86e-10 |
+| Output norm | 3.12e-02 | 1.40e-04 |
+| **Final output (E2E)** | **1.25e-01** | **1.20e-03** |
+
+**L22, full_model, BF16 — Chunk (Pallas, overlay)**
+
+Same accumulated intermediates, swapping fused_recurrent → chunk_kda at the kernel stage, recomputing downstream. Pre-kernel stages identical by construction.
+
+| Stage | max_abs | mean_abs |
+|-------|---------|----------|
+| KDA output (chunk) | 7.32e-04 | 1.70e-06 |
+| Output norm (chunk→) | 3.12e-02 | 1.51e-04 |
+| **Final output (E2E, chunk→)** | **1.25e-01** | **1.24e-03** |
+
+E2E error is **1.25e-01 = 2⁻³** for both kernels — the bf16 quantization floor. Both kernels are functionally equivalent at production precision.
+
+### FP32 Reference (L22, DEFAULT vs HIGH)
+
+FP32 tests reveal the error pipeline structure that bf16 quantization obscures. `Precision.HIGH` overrides TPU MXU matmul precision via `jax.default_matmul_precision("high")`.
+
+**Per-Stage Isolated Error (FP32)**
 
 | Stage | Input source | DEFAULT max_abs | DEFAULT mean_abs | HIGH max_abs | HIGH mean_abs |
 |-------|-------------|----------------|-----------------|-------------|--------------|
@@ -81,17 +144,7 @@ Each stage receives the **GPU dump intermediate** as input, isolating that stage
 | Output norm | GPU o_kda + GPU g_out | 7.21e-03 | 5.14e-05 | 7.21e-03 | 5.14e-05 |
 | Final output (o_proj) | GPU o_norm | 5.13e-02 | 3.82e-04 | 5.13e-02 | 3.82e-04 |
 
-`Precision.HIGH` behavior by stage category:
-
-- **Single matmul from hidden_states** (projections, beta, final output): DEFAULT = HIGH — input is bf16-precision, truncation is lossless.
-- **GPU dump → production function** (conv, kernel, norm): DEFAULT = HIGH — no matmul precision dependence.
-- **Two chained matmuls** (gate, output gate): the second matmul's input (`f_a` / `g_a`) is a TPU fp32 intermediate. HIGH computes it more precisely (closer to fp32 truth), but the GPU reference was bf16 matmul. Gate diverges 2× (1.22e-01 → 2.38e-01) because `exp(A_log) ≈ 62.7×` amplifies this; output gate barely changes (3.00e-02 → 2.86e-02) because it has no exponential amplification.
-
-### Per-Stage Accumulated Error (Full-Model, L22)
-
-Production `KimiDeltaAttention.__call__` with `intermediates` capture. Script: `--mode accumulated --source full-model`.
-
-**L22, full_model, FP32 — DEFAULT vs HIGH**
+**Per-Stage Accumulated Error (FP32)**
 
 | Stage | DEFAULT max_abs | DEFAULT mean_abs | HIGH max_abs | HIGH mean_abs |
 |-------|----------------|-----------------|-------------|--------------|
@@ -109,48 +162,14 @@ Production `KimiDeltaAttention.__call__` with `intermediates` capture. Script: `
 | Output norm | 1.33e-02 | 1.34e-04 | 1.33e-02 | 1.37e-04 |
 | **Final output (E2E)** | **1.06e-01** | **1.12e-03** | **6.31e-02** | **1.04e-03** |
 
-Gate under HIGH (2.38e-01) is **larger** than DEFAULT (1.22e-01) — HIGH changes the TPU gate computation but moves it further from the GPU bf16 result. This confirms that the dominant error source for full-model inputs is **cross-device bf16 matmul divergence**, not TPU precision truncation.
+Chunk overlay (FP32): KDA output 2.42e-04 / 1.38e-06, E2E 1.06e-01 / 1.15e-03 (DEFAULT); 6.38e-02 / 1.08e-03 (HIGH).
 
-### Value Distributions (Full-Model, L22, FP32)
+`Precision.HIGH` behavior:
+- **Single matmul from hidden_states** (projections, beta, final output): DEFAULT = HIGH — input is bf16-precision, truncation is lossless.
+- **GPU dump → production function** (conv, kernel, norm): DEFAULT = HIGH — no matmul precision dependence.
+- **Two chained matmuls** (gate, output gate): HIGH computes the fp32 intermediate more precisely, but moves it further from the GPU bf16 reference. Gate diverges 2× (1.22e-01 → 2.38e-01) because `exp(A_log) ≈ 62.7×` amplifies this.
 
-| Stage | Source | mean | var | min | max |
-|-------|--------|------|-----|-----|-----|
-| Q projection | TPU | -3.55e-03 | 1.66e+00 | -2.06e+01 | 1.04e+01 |
-| | GPU | -3.55e-03 | 1.66e+00 | -2.06e+01 | 1.04e+01 |
-| Gate (fused_kda_gate) | TPU | -1.23e+00 | 7.26e+00 | -7.97e+01 | ~0 |
-| | GPU | -1.23e+00 | 7.26e+00 | -7.96e+01 | ~0 |
-| Output gate (g_out) | TPU | -6.08e-01 | 2.84e+00 | -1.01e+01 | 1.14e+01 |
-| | GPU | -6.09e-01 | 2.84e+00 | -1.01e+01 | 1.14e+01 |
-
-Gate values span `[-80, 0]` (vs `[-346, 0]` in isolated dump with T=128) — shorter sequence (T=5) produces smaller gate magnitudes.
-
-### Error Pipeline Summary
-
-| Path | Stage | Accumulated error | Source |
-|------|-------|------------------|--------|
-| hidden → q/k/v | projection matmul | <u>~5e-2</u> | cross-device bf16 matmul divergence |
-| q/k/v → heads | conv+SiLU (K=4) | ~5e-2 (cum.) | propagated from projection |
-| hidden → raw_gate | gate projection (2 matmuls) | ~5e-2 | cross-device bf16 matmul divergence |
-| raw_gate → g | fused_kda_gate | **~1e-1** | exp(A_log) amplifies matmul error |
-| hidden → beta | sigmoid | ~7e-4 | small (sigmoid compresses range) |
-| normed+g+beta → o | fused_recurrent kernel | ~2e-4 | near bit-exact |
-| hidden → g_out | output gate projection | <u>~3e-2</u> | cross-device bf16 matmul divergence |
-| o+g_out → o_norm | GatedRMSNorm | ~1e-2 | gate magnitude × kernel error |
-| o_norm → output | o_proj matmul | ~1e-1 | matmul + upstream accumulation |
-
-### Key Findings
-
-1. **Error is dominated by cross-device bf16 matmul divergence.** Full-model `hidden_states` are produced by GPU bf16 matmul — the error at projection stages (~5e-2) is from H100 vs TPU MXU bf16 arithmetic differences. `Precision.HIGH` has zero effect on projections (DEFAULT = HIGH), confirming this is not fp32→bf16 truncation.
-
-2. **Gate max_abs (1.22e-01) is smaller than isolated dump (1.65e+00)** because full-model T=5 produces smaller gate magnitudes (range `[-80, 0]` vs `[-346, 0]` for T=128). The exp(A_log) amplification (~62.7×) applies the same way, but the base error is smaller.
-
-3. **`Precision.HIGH` has limited benefit for full-model inputs** — E2E error reduces only ~1.7× (1.06e-01 → 6.31e-02), vs ~3× for isolated dumps. Gate under HIGH actually increases (1.22e-01 → 2.38e-01) because HIGH moves TPU computation further from the GPU bf16 result. The fused recurrent kernel (~2e-4) and GatedRMSNorm (~1e-2) are the main residual contributors.
-
-4. **The fused recurrent kernel is near bit-exact** — isolated error 1.06e-04 (max_abs), 5.64e-07 (mean_abs). This confirms the kernel implementation is correct; all module-level error originates from matmul stages.
-
-### Minimal Reproduction
-
-Single matmul `hidden_states [128, 2304] @ q_proj_w [2304, 4096]` on L22, GPU dump vs TPU (`jax.lax.dot`):
+**Minimal Reproduction** — single matmul `hidden_states [128, 2304] @ q_proj_w [2304, 4096]` on L22:
 
 | Precision | FP32 max_abs | FP32 mean_abs | BF16 max_abs | BF16 mean_abs |
 |---|---|---|---|---|
@@ -158,9 +177,34 @@ Single matmul `hidden_states [128, 2304] @ q_proj_w [2304, 4096]` on L22, GPU du
 | HIGH (3-pass) | 8.44e-05 | 7.73e-06 | 3.80e-02 | 3.56e-03 |
 | HIGHEST (6-pass) | 8.58e-06 | 6.64e-07 | 3.80e-02 | 3.56e-03 |
 
-FP32 inputs: `HIGH` improves ~300×, `HIGHEST` ~3000× (near fp32 machine epsilon), confirming pipeline correctness. BF16 inputs: no change — `precision` only affects fp32→bf16 truncation in the multiplier; bf16 inputs are already at native MXU precision, so these results represent the production precision floor.
+FP32: HIGH improves ~300×, HIGHEST ~3000×. BF16: no change — bf16 inputs are already at native MXU precision. Script: `--mode matmul-only`.
 
-Script: `test/layers/test_kda_precision_analysis.py --mode matmul-only`.
+### Error Pipeline Summary
+
+| Path | Stage | BF16 error | FP32 error | Source |
+|------|-------|-----------|-----------|--------|
+| hidden → q/k/v | projection matmul | ~1e-2 | ~5e-2 | cross-device bf16 matmul divergence |
+| q/k/v → heads | conv+SiLU (K=4) | ~3e-2 | ~5e-2 | conv rounding propagation |
+| hidden → raw_gate | gate projection (2 matmuls) | — | ~5e-2 | cross-device bf16 matmul divergence |
+| raw_gate → g | fused_kda_gate | **~1e-1** | **~1e-1** | exp(A_log) amplifies matmul error |
+| hidden → beta | sigmoid | ~8e-4 | ~7e-4 | small (sigmoid compresses range) |
+| normed+g+beta → o | fused_recurrent kernel | ~5e-4 | ~2e-4 | near bit-exact |
+| normed+g+beta → o | chunk_kda (Pallas) kernel | ~5e-4 | ~2e-4 | near bit-exact (matches fused_rec) |
+| hidden → g_out | output gate projection | ~0 | ~3e-2 | bf16: bit-identical; fp32: matmul divergence |
+| o+g_out → o_norm | GatedRMSNorm | ~3e-2 | ~1e-2 | gate magnitude × kernel error |
+| o_norm → output | o_proj matmul | **~1e-1** | **~1e-1** | matmul + upstream accumulation |
+
+### Key Findings
+
+1. **Error is dominated by cross-device bf16 matmul divergence.** Full-model `hidden_states` are produced by GPU bf16 matmul — projection error (~1e-2 bf16, ~5e-2 fp32) comes from H100 vs TPU MXU arithmetic differences. FP32 `Precision.HIGH` has zero effect on projections (DEFAULT = HIGH), confirming this is not fp32→bf16 truncation.
+
+2. **Gate is the largest single-stage error source** — exp(A_log) amplification (~62.7× at L22, higher at L24/L25) turns ~1e-2 matmul error into ~1e-1 gate error. L24 is worst (3.05e-01 bf16) because gate range spans `[-264, 0]` vs `[-80, 0]` at L22.
+
+3. **Both kernels are near bit-exact** — isolated error ~2-5e-4 (max_abs) for both fused_recurrent and chunk_kda across bf16 and fp32. E2E is identical at bf16 precision (1.25e-01 = 2⁻³ for both). All module-level error originates from matmul stages, not kernels.
+
+4. **Recurrent state: chunk ~2-3× worse than fused** — chunk state accumulation uses a different algorithm (inter-chunk propagation vs step-by-step scan). L22 chunk state error (1.76e-02 bf16) is the worst; this propagates into every subsequent decode step.
+
+5. **BF16 quantization is the E2E floor** — E2E max_abs clusters at 1.25e-01 = 2⁻³ (bf16) regardless of kernel choice. FP32 E2E is ~1.06e-01 (DEFAULT) and improves to 6.31e-02 under HIGH, but bf16 cannot benefit from precision overrides.
 
 ---
 

@@ -19,7 +19,6 @@ Usage:
     python -m sgl_jax.test.layers.test_kda_precision_analysis --mode matmul-only
     python -m sgl_jax.test.layers.test_kda_precision_analysis --mode accumulated --layer L22 --dtype fp32
     python -m sgl_jax.test.layers.test_kda_precision_analysis --mode accumulated --precision high
-    python -m sgl_jax.test.layers.test_kda_precision_analysis --mode accumulated --kernel pallas
     python -m sgl_jax.test.layers.test_kda_precision_analysis --mode isolated --layer L22 --dtype fp32
 """
 
@@ -272,12 +271,15 @@ def run_matmul_only(layer_dir: str, dtype: jnp.dtype):
 
 
 # ---------------------------------------------------------------------------
-# Mode: pipeline (production forward with intermediates capture)
+# Mode: accumulated (production forward with intermediates capture)
+#   Runs the full KimiDeltaAttention pipeline (naive kernel) and compares
+#   each captured intermediate against the GPU dump.  Error at each stage
+#   includes all upstream error propagation — hence "accumulated".
 # ---------------------------------------------------------------------------
 
-def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: str,
-                 source: str = "isolated", kernel: str = "naive"):
-    """Run production KimiDeltaAttention.__call__ with intermediates capture."""
+def run_accumulated(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: str,
+                 source: str = "isolated"):
+    """Run production KimiDeltaAttention.__call__ with intermediates capture (accumulated error)."""
     layer_name = os.path.basename(layer_dir)
     if source == "full-model":
         layer_idx = _LAYER_NAME_TO_IDX[layer_name]
@@ -306,8 +308,6 @@ def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
     )
 
     fb, pool = _build_extend_env(module, T, init_state, cu_seqlens)
-    if kernel == "pallas":
-        fb.attn_backend.use_pallas_prefill = True
 
     intermediates = {}
     ctx = (
@@ -326,17 +326,88 @@ def run_pipeline(layer_dir: str, case_name: str, dtype: jnp.dtype, precision: st
         else:
             rows.append({"label": label, "skip": True})
 
-    # Final output
-    out_key = "out_fp32" if dtype == jnp.float32 else "out_bf16"
-    rows.append(compare_stage("Final output (o_proj)", output, case, out_key))
+    # Final output — full-model dumps always store as out_fp32
+    if source == "full-model":
+        out_key = "out_fp32"
+    else:
+        out_key = "out_fp32" if dtype == jnp.float32 else "out_bf16"
+    rows.append(compare_stage("Final output (E2E)", output, case, out_key))
 
     dtype_label = "fp32" if dtype == jnp.float32 else "bf16"
     N = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else 1
-    kernel_label = "pallas" if kernel == "pallas" else "naive"
-    title = f"{case_name} ({dtype_label}, T={T}, N={N}, precision={precision.upper()}, kernel={kernel_label})"
+    title = f"{case_name} ({dtype_label}, T={T}, N={N}, precision={precision.upper()}, kernel=naive)"
     print_error_table(rows, title)
     print_distribution_table(rows, title)
-    return rows
+    return rows, intermediates, module, case, out_key
+
+
+def run_chunk_overlay(
+    module, case: dict, intermediates: dict, T: int, dtype: jnp.dtype,
+    precision: str, source: str, init_state, out_key: str,
+):
+    """Run chunk_kda with accumulated intermediates from naive pipeline.
+
+    Takes the captured intermediates (q/k/v_after_conv, g, beta) from a prior
+    run_accumulated() call, feeds them through chunk_kda, then recomputes
+    output_norm and o_proj.  This avoids the Manual-mesh requirement of running
+    the full Pallas pipeline under an Explicit mesh.
+    """
+    if "q_after_conv" not in intermediates:
+        return
+
+    H, D = module.num_heads, module.head_dim
+
+    # Strip Explicit-mesh sharding so Pallas doesn't see it.
+    def _plain(x):
+        return jnp.asarray(np.asarray(x))
+
+    q_norm = _plain(l2_normalize(intermediates["q_after_conv"]))
+    k_norm = _plain(l2_normalize(intermediates["k_after_conv"]))
+    v_acc = _plain(intermediates["v_after_conv"])
+    g_acc = _plain(intermediates["g"]).astype(jnp.float32)
+    beta_acc = _plain(intermediates.get("beta"))
+    if beta_acc is not None and beta_acc.ndim == 3:
+        beta_acc = beta_acc.reshape(T, H)
+    beta_acc = beta_acc.astype(jnp.float32)
+
+    pool_init = jnp.zeros((1, H, D, D), dtype=jnp.float32)
+    if init_state is not None:
+        pool_init = init_state
+
+    chunk_cu = jnp.array([0, T], dtype=jnp.int32)
+    o_chunk, _, *_ = chunk_kda(
+        q_norm[None], k_norm[None], v_acc[None],
+        g_acc[None], beta_acc[None],
+        scale=D**-0.5,
+        initial_state=pool_init,
+        output_final_state=True,
+        cu_seqlens=chunk_cu,
+        use_gate_in_kernel=False,
+    )
+    o_chunk = o_chunk[0]
+
+    # Downstream: output_norm and o_proj using chunk output
+    o_kda_chunk = o_chunk.reshape(T, H, D)
+    output_gate = intermediates["output_gate"]
+    o_norm_chunk = module.o_norm(o_kda_chunk, output_gate)
+    ctx = (
+        jax.default_matmul_precision(precision)
+        if precision != "default"
+        else contextlib.nullcontext()
+    )
+    with ctx:
+        final_chunk, _ = module.o_proj(o_norm_chunk.reshape(T, H * D))
+
+    o_kda_key = "intermediates__o_kda" if source == "full-model" else "intermediates__o_kda_chunk"
+    rows = [
+        compare_stage("KDA output (chunk)", o_chunk, case, o_kda_key),
+        compare_stage("Output norm (chunk→)", o_norm_chunk, case, "intermediates__o_norm"),
+        compare_stage("Final output (E2E, chunk→)", final_chunk, case, out_key),
+    ]
+
+    dtype_label = "fp32" if dtype == jnp.float32 else "bf16"
+    title = f"chunk overlay ({dtype_label}, T={T}, precision={precision.upper()})"
+    print_error_table(rows, title)
 
 
 # ---------------------------------------------------------------------------
@@ -510,10 +581,6 @@ def main():
         "--source", default="isolated", choices=["isolated", "full-model"],
         help="Dump source: isolated layer dumps or full-model dumps",
     )
-    parser.add_argument(
-        "--kernel", default="naive", choices=["naive", "pallas"],
-        help="Kernel for accumulated mode: naive (fused_recurrent) or pallas (chunk_kda)",
-    )
     args = parser.parse_args()
 
     layer_dir = os.path.join(DUMP_BASE, args.layer)
@@ -531,12 +598,22 @@ def main():
         if args.layer not in _LAYER_NAME_TO_IDX:
             print(f"ERROR: {args.layer} not a valid KDA layer for full-model dumps")
             sys.exit(1)
-        # Full-model has a single case per layer, ignore --case and --all-cases
         if args.mode == "isolated":
             run_isolated(layer_dir, "full_model", dtype, args.precision, source="full-model")
         else:
-            run_pipeline(layer_dir, "full_model", dtype, args.precision,
-                         source="full-model", kernel=args.kernel)
+            rows, intermediates, module, case, out_key = run_accumulated(
+                layer_dir, "full_model", dtype, args.precision, source="full-model",
+            )
+            T = int(case["T"])
+            has_init = bool(case.get("has_initial_state", False))
+            init_state = (
+                jnp.asarray(case["initial_recurrent_state"], dtype=jnp.float32)
+                if has_init else None
+            )
+            run_chunk_overlay(
+                module, case, intermediates, T, dtype,
+                args.precision, "full-model", init_state, out_key,
+            )
     else:
         cases = ALL_CASES if args.all_cases else [args.case]
         if args.mode == "isolated":
@@ -548,8 +625,21 @@ def main():
         else:
             for cn in cases:
                 try:
-                    run_pipeline(layer_dir, cn, dtype, args.precision,
-                                 source="isolated", kernel=args.kernel)
+                    rows, intermediates, module, case, out_key = run_accumulated(
+                        layer_dir, cn, dtype, args.precision, source="isolated",
+                    )
+                    T = int(case["T"])
+                    has_init = bool(case.get("has_initial_state", False))
+                    has_cu = bool(case.get("has_cu_seqlens", False))
+                    init_state = (
+                        jnp.asarray(case["initial_recurrent_state"], dtype=jnp.float32)
+                        if has_init else None
+                    )
+                    if not has_cu:
+                        run_chunk_overlay(
+                            module, case, intermediates, T, dtype,
+                            args.precision, "isolated", init_state, out_key,
+                        )
                 except FileNotFoundError as e:
                     print(f"\n  {cn}: {e} -- skipped")
 
