@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
@@ -24,10 +26,12 @@ if TYPE_CHECKING:
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
-    def __init__(self, mesh: jax.sharding.Mesh = None, use_pallas_prefill: bool = False):
+    def __init__(self, mesh: jax.sharding.Mesh = None, use_pallas_prefill: bool | None = None):
         super().__init__(
             mesh=mesh,
         )
+        if use_pallas_prefill is None:
+            use_pallas_prefill = os.environ.get("SGLANG_KDA_PALLAS_PREFILL", "0") == "1"
         self.use_pallas_prefill = use_pallas_prefill
 
     def __call__(
