@@ -46,6 +46,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         recurrent_state_pool,
         **kwargs,
     ) -> jax.Array:
+        intermediates = kwargs.pop("intermediates", None)
         recurrent_indices = self.forward_metadata.recurrent_indices
         ssm_states, conv_states = self.get_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices
@@ -90,6 +91,10 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         q = q.reshape(q.shape[0], layer.num_q_heads, layer.head_q_dim)
         k = k.reshape(k.shape[0], layer.num_k_heads, layer.head_k_dim)
         v = v.reshape(v.shape[0], layer.num_v_heads, layer.head_v_dim)
+        if intermediates is not None:
+            intermediates["q_after_conv"] = q
+            intermediates["k_after_conv"] = k
+            intermediates["v_after_conv"] = v
 
         # KDA requires L2-normalized q/k for all paths (decode, naive prefill,
         # Pallas prefill). The official implementation does this inside the
@@ -97,6 +102,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         # that flag yet, so we normalize in JAX up front.
         q = l2_normalize(q)
         k = l2_normalize(k)
+
+        if intermediates is not None:
+            intermediates["g"] = self._fused_kda_gate(layer, a)
 
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             output, new_recurrent = self._forward_extend(
@@ -123,6 +131,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             )
         else:
             raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
+
+        if intermediates is not None:
+            intermediates["recurrent_state"] = new_recurrent
 
         new_ssm_full = self.set_ssm_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
