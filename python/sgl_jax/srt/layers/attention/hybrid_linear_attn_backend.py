@@ -91,23 +91,6 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             sharding=(NamedSharding(self.mesh, P("data"))),
         )
 
-        # [KDA-E2E DEBUG] log per-rank metadata sharding once per call (remove after validation)
-        import os as _os
-
-        if (
-            not getattr(self, "_kda_dbg_logged", False)
-            and _os.environ.get("KDA_E2E_DEBUG", "0") == "1"
-        ):
-            print(
-                f"[KDA-E2E DEBUG][get_forward_metadata] mode={batch.forward_mode} "
-                f"dp_size={batch.dp_size} per_dp_bs={batch.per_dp_bs_size} "
-                f"cu_q_lens.shape={metadata.cu_q_lens.shape} "
-                f"recurrent_indices.shape={metadata.recurrent_indices.shape} "
-                f"sharding={metadata.cu_q_lens.sharding}",
-                flush=True,
-            )
-            self._kda_dbg_logged = True
-
         return metadata
 
     def tree_flatten(self):
@@ -201,10 +184,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         v: jax.Array,
         layer,  # RadixAttention or RadixLinearAttention
         forward_batch: ForwardBatch,
-        pool,  # token_to_kv_pool (full attn) or recurrent_state_pool (linear attn)
+        pool=None,  # positional convenience (kept for backwards compat)
         mixed_qkv: jax.Array | None = None,  # For linear attention
         a: jax.Array | None = None,  # For linear attention
         b: jax.Array | None = None,  # For linear attention
+        token_to_kv_pool=None,  # RadixAttention.__call__ passes this kw
+        recurrent_state_pool=None,  # RadixLinearAttention.__call__ passes this kw
         **kwargs,
     ):
         """Dispatch by layer.layer_id.
@@ -212,7 +197,17 @@ class HybridLinearAttnBackend(AttentionBackend):
         full-attn sub-backend gets pool as `token_to_kv_pool=`; linear-attn
         sub-backend gets the same value as `recurrent_state_pool=` plus the
         linear-only mixed_qkv / a / b kwargs.
+
+        Accepts pool as positional (`pool`) OR as either of the two named
+        kwargs (`token_to_kv_pool`, `recurrent_state_pool`) so that both
+        `RadixAttention` and `RadixLinearAttention` invocation conventions
+        work without the caller knowing which sub-backend will run.
         """
+        resolved_pool = (
+            pool
+            if pool is not None
+            else (token_to_kv_pool if token_to_kv_pool is not None else recurrent_state_pool)
+        )
         if layer.layer_id in self.full_attn_layers:
             return self.full_attn_backend(
                 q,
@@ -220,7 +215,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 v,
                 layer=layer,
                 forward_batch=forward_batch,
-                token_to_kv_pool=pool,
+                token_to_kv_pool=resolved_pool,
                 **kwargs,
             )
         return self.linear_attn_backend(
@@ -232,7 +227,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
-            recurrent_state_pool=pool,
+            recurrent_state_pool=resolved_pool,
             **kwargs,
         )
 
@@ -244,5 +239,22 @@ def attn_backend_wrapper(
     runner: ModelRunner,
     full_attn_backend: AttentionBackend,
 ):
-    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models."""
-    return full_attn_backend
+    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
+
+    For hybrid recurrent models (e.g. Kimi-Linear: KDA + MLA), build the
+    matching linear sub-backend and route by layer_id. For pure full-attn
+    models, return the full_attn_backend unchanged.
+    """
+    cfg = runner.linear_recurrent_config
+    if cfg is None:
+        return full_attn_backend
+
+    # Only supported linear sub-backend today is KDA.
+    from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+
+    linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
+    return HybridLinearAttnBackend(
+        full_attn_backend=full_attn_backend,
+        linear_attn_backend=linear_attn_backend,
+        full_attn_layers=cfg.full_attention_layer_ids,
+    )

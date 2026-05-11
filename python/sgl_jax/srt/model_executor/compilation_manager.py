@@ -310,6 +310,12 @@ class CompilationManager:
             per_dp_bs_size=per_dp_bs_size,
             real_bs_per_dp=[bs] * dp_size,
             logits_indices_selector=np.arange(bs, dtype=np.int32),
+            # For hybrid recurrent models (KDA), provide dummy slot indices /
+            # initial-state mask so the linear backend doesn't index a buffer
+            # with `None`. Slot 0 is the per-rank dummy slot reserved by
+            # RecurrentStatePool, so it's safe to point at it during precompile.
+            recurrent_indices=np.zeros(bs, dtype=np.int32),
+            has_initial_state=np.zeros(bs, dtype=np.bool_),
         )
 
     # ---- Lazy compilation tracking ----
