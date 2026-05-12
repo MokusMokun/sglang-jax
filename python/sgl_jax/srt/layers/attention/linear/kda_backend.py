@@ -174,11 +174,26 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         return ssm, conv
 
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
-        """Scatter per-request ``new_recurrent`` into the FULL pool buffer."""
+        """Scatter per-request ``new_recurrent`` into the FULL pool buffer.
+
+        Writes at ``idx==0`` (per-rank dummy slot) are suppressed: padding
+        batch entries carry idx=0, and letting them scatter pollutes the
+        dummy slot which is then read as initial-state for future padding
+        rows -- accumulating garbage that eventually leaks into real slots
+        through later forward computations.
+        """
         full_recurrent, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
 
+        def _scatter(buf, idx, val):
+            # mask shape broadcasts over ssm dims (H, K, V) → keep buf at idx
+            # whenever idx == 0, write val otherwise.
+            keep_mask = (idx == 0).reshape(-1, 1, 1, 1)
+            old = buf[idx]
+            safe_val = jnp.where(keep_mask, old, val)
+            return buf.at[idx].set(safe_val)
+
         return jax.shard_map(
-            lambda buf, idx, val: buf.at[idx].set(val),
+            _scatter,
             mesh=self.mesh,
             in_specs=(
                 P("data", "tensor", None, None),
@@ -190,13 +205,22 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )(full_recurrent, recurrent_indices, new_recurrent)
 
     def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv_packed):
-        """Scatter per-request packed conv state into the FULL pool buffer."""
+        """Scatter per-request packed conv state into the FULL pool buffer.
+
+        Same dummy-slot guard as ``set_ssm_state``.
+        """
         _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
         assert len(conv_buffer_list) == 1
         full_conv = conv_buffer_list[0]
 
+        def _scatter(buf, idx, val):
+            keep_mask = (idx == 0).reshape(-1, 1, 1)
+            old = buf[idx]
+            safe_val = jnp.where(keep_mask, old, val)
+            return buf.at[idx].set(safe_val)
+
         new_conv_full = jax.shard_map(
-            lambda buf, idx, val: buf.at[idx].set(val),
+            _scatter,
             mesh=self.mesh,
             in_specs=(
                 P("data", "tensor", None),
