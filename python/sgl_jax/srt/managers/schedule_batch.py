@@ -2162,6 +2162,57 @@ class ScheduleBatch:
             top_logprobs_nums = None
             token_ids_logprobs = None
 
+        use_padded_input_logprob = (
+            self.return_logprob
+            and self.forward_mode.is_extend()
+            and not self.enable_overlap
+            and not self.return_hidden_states
+            and not (top_logprobs_nums and any(x > 0 for x in top_logprobs_nums))
+            and not (token_ids_logprobs and any(x is not None for x in token_ids_logprobs))
+        )
+        input_logprob_indices = None
+        merged_extend_input_logprob_token_ids = None
+        if self.return_logprob:
+            if use_padded_input_logprob:
+                input_logprob_indices = np.zeros(total_token_size, dtype=np.int32)
+                merged_extend_input_logprob_token_ids = np.zeros(total_token_size, dtype=np.int32)
+                token_offset = 0
+                for info in self.reqs_info:
+                    out_pt = token_offset
+                    local_pt = 0
+                    token_id_pt = 0
+                    starts = info.extend_logprob_start_lens or []
+                    token_ids = info.extend_input_logprob_token_ids
+                    for extend_len, start_len in zip(info.extend_lens or [], starts):
+                        num_logprobs = max(extend_len - start_len, 0)
+                        if num_logprobs > 0:
+                            end_pt = out_pt + num_logprobs
+                            input_logprob_indices[out_pt:end_pt] = np.arange(
+                                local_pt + start_len,
+                                local_pt + extend_len,
+                                dtype=np.int32,
+                            )
+                            if token_ids is not None:
+                                merged_extend_input_logprob_token_ids[out_pt:end_pt] = token_ids[
+                                    token_id_pt : token_id_pt + num_logprobs
+                                ]
+                            out_pt = end_pt
+                            token_id_pt += num_logprobs
+                        local_pt += extend_len
+                    token_offset += per_dp_token_padding
+            else:
+                # Merge per-DP extend_input_logprob_token_ids (set on info at L1099 when
+                # return_logprob=True). Previously hardcoded None below, which combined
+                # with the new server-side scalar gather caused 'NoneType.reshape' in
+                # LogitsProcessor._select_input_token_logprobs.
+                chunks = [
+                    info.extend_input_logprob_token_ids
+                    for info in self.reqs_info
+                    if getattr(info, "extend_input_logprob_token_ids", None) is not None
+                ]
+                if chunks:
+                    merged_extend_input_logprob_token_ids = np.concatenate(chunks)
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -2181,7 +2232,8 @@ class ScheduleBatch:
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            extend_input_logprob_token_ids=None,
+            extend_input_logprob_token_ids=merged_extend_input_logprob_token_ids,
+            input_logprob_indices=input_logprob_indices,
             logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
@@ -2369,6 +2421,7 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode.is_extend() else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            input_logprob_indices=None,
             logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
@@ -2829,6 +2882,7 @@ class ModelWorkerBatch:
     extend_prefix_lens: np.ndarray | None
     extend_logprob_start_lens: list[int] | None
     extend_input_logprob_token_ids: np.ndarray | None
+    input_logprob_indices: np.ndarray | None
     logits_indices: np.ndarray | None
 
     # For padding
