@@ -1,9 +1,10 @@
 """Unified radix cache: a component-based radix tree over the device KV cache.
 
-Stage 1 ports the FULL-attention subset of upstream sglang's UnifiedRadixCache.
-All per-component behavior (matching, locking, eviction, split redistribution)
-is delegated to TreeComponent implementations so that later stages (SWA, Mamba,
-HiCache) plug in without touching the core walk.
+Ports upstream sglang's UnifiedRadixCache. Per-component behavior (matching,
+locking, eviction, split redistribution) is delegated to TreeComponent
+implementations: a FULL-attention component plus a leaf-only recurrent
+component (KDA / GDN). SWA / HiCache components plug into the same contract
+without touching the core walk.
 """
 
 from __future__ import annotations
@@ -103,6 +104,8 @@ class UnifiedRadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         is_eagle: bool = False,
         tree_components: tuple[ComponentType, ...] = (ComponentType.FULL,),
+        enable_recurrent_extra_buffer: bool = False,
+        recurrent_track_interval: int | None = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -114,6 +117,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.max_seq_len = max_seq_len
         self.dtype = dtype
         self.enable_kv_cache_events = enable_kv_cache_events
+        self.enable_recurrent_extra_buffer = enable_recurrent_extra_buffer
+        self.recurrent_track_interval = recurrent_track_interval
         self.kv_event_queue: list = []
 
         self.process_id = jax.process_index()
@@ -220,10 +225,27 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_recurrent(self) -> bool:
         return ComponentType.RECURRENT in self.components
 
-    def assert_recurrent_slot_ledger(self, dp_rank: int = 0) -> int:
+    def recurrent_extra_buffer_active(self) -> bool:
+        return (
+            self.supports_recurrent()
+            and self.enable_recurrent_extra_buffer
+            and self.recurrent_track_interval is not None
+        )
+
+    def recurrent_evictable_size(self, dp_rank: int = 0) -> int:
+        """Unlocked tree-owned recurrent slots on ``dp_rank`` — what ``evict``
+        can reclaim (protected/locked snapshots excluded)."""
+        return self.component_evictable_size_[ComponentType.RECURRENT][dp_rank]
+
+    def assert_recurrent_slot_ledger(self, dp_rank: int = 0, live_reqs: list | None = None) -> int:
         """Per-rank invariant ``active + tree_owned + free == slots_per_rank``;
         returns the derived ``active`` (request-owned) count. Tree-owned =
-        recurrent evictable + protected; free = recurrent free-list length."""
+        recurrent evictable + protected; free = recurrent free-list length.
+
+        When ``live_reqs`` is given, the structurally-derived ``active`` is
+        cross-checked against the slots those requests actually hold (running +
+        ping-pong track), so a leaked track slot is caught rather than silently
+        absorbed into the tautological subtraction."""
         ct = ComponentType.RECURRENT
         rtp = self.req_to_token_pool
         free = len(rtp.recurrent_free_slots[dp_rank])
@@ -237,6 +259,13 @@ class UnifiedRadixCache(BasePrefixCache):
             f"recurrent slot ledger broken (dp={dp_rank}): free={free} "
             f"tree_owned={tree_owned} > slots_per_rank={slots}"
         )
+        if live_reqs is not None:
+            owned = rtp.count_request_owned_recurrent_slots(live_reqs, dp_rank)
+            assert owned == active, (
+                f"recurrent slot leak (dp={dp_rank}): request-owned={owned} != "
+                f"active={active} (free={free} tree_owned={tree_owned} "
+                f"slots_per_rank={slots})"
+            )
         return active
 
     def inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
@@ -292,7 +321,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Let each component fill its insert fields and return an effective
         # cache length; the inserted key is capped to the min across components.
-        # All components return None today, so this leaves the full length.
+        # FULL returns None (full length); the recurrent component returns its
+        # effective cache len, capping the key to the recurrent boundary.
         insert_params = InsertParams() if is_insert else None
         effective_cache_len = len(token_ids)
         if is_insert:
@@ -374,7 +404,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Let each component fill its insert fields and return an effective
         # cache length; the inserted key is capped to the min across components.
-        # All components return None today, so this leaves the full length.
+        # FULL returns None (full length); the recurrent component returns its
+        # effective cache len, capping the key to the recurrent boundary.
         insert_params = InsertParams()
         effective_cache_len = all_token_len
         for component in self._components_tuple:
@@ -385,17 +416,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 effective_cache_len = min(effective_cache_len, cl)
 
         if effective_cache_len <= 0:
-            # No new tree key materialized this round, but the chunk's KV is
-            # committed and request-owned. Advance prefix_indices to the
-            # committed range (mirroring ChunkCache.cache_unfinished_req) so the
-            # next chunked round extends from here. The scheduler continues a
-            # chunked req via init_next_round_input() WITHOUT re-matching the
-            # tree, then prepare_for_extend allocates from len(prefix_indices);
-            # leaving it stale makes the next round re-allocate over this chunk's
-            # KV and orphan its pages (token_to_kv_pool leak). Leave
-            # cache_protected_len / last_matched_prefix_len unchanged: nothing
-            # entered the tree, so the committed tail stays request-owned and is
-            # freed from old_prefix_len on finish/retract.
+            # Nothing entered the tree this round, but the chunk's KV is committed.
+            # Advance prefix_indices to the committed range (like ChunkCache) so the
+            # next chunked round extends from here; leaving it stale re-allocates over
+            # this chunk's KV and orphans its pages (token_to_kv_pool leak).
+            # cache_protected_len / last_matched_prefix_len stay unchanged so the
+            # committed tail is freed from old_prefix_len on finish/retract.
             req.prefix_indices = kv_indices.copy()
             for component in self._components_tuple:
                 component.cleanup_after_caching_req(
@@ -532,8 +558,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Number of value CHUNKS accepted at the best match, not a token
         # count (upstream seam name kept for port parity).
         best_value_len = 0
-        # Stage 1 has no host tier: device-only matching is the only mode, so
-        # the best match and the best device match coincide.
+        # No host tier (HiCache unimplemented): device-only matching is the
+        # only mode, so the best match and the best device match coincide.
         # full_only: a request's own FULL-prefix bookkeeping (cache_unfinished_req
         # re-match) must not be gated on aux components (e.g. recurrent state,
         # which lives in the running slot, not the tree).
@@ -674,8 +700,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 node = self._split_node(node.key, node, prefix_len)
 
             # Let each component claim ownership of overlapping KV slots.
-            # FULL never consumes; duplicate frees stay in cache_*_req (this
-            # repo's convention), so the returned index is unused in stage 1.
+            # FULL never consumes and recurrent does not override this overlap
+            # hook; duplicate frees stay in cache_*_req (this repo's
+            # convention), so the returned index is currently unused.
             value_slice = value[:prefix_len]
             for component in self._components_tuple:
                 component.update_component_on_insert_overlap(
@@ -726,9 +753,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def _cascade_evict(self, node: UnifiedTreeNode) -> None:
         """Tombstone the base value after all components have been driven.
 
-        Stage 1 collapses the upstream priority cascade: FULL is both the
-        trigger and the only component. The deferral contract puts
-        value = None here, not in FullComponent.evict_component."""
+        FULL is the eviction trigger (device-leaf status keys off its value);
+        the base-value tombstone is deferred to here -- after every component's
+        evict_component has run -- rather than inside FullComponent, so an aux
+        component (e.g. recurrent) can still read FULL.value while evicting."""
         node.component_data[BASE_COMPONENT_TYPE].value = None
         self._update_evictable_leaf_sets(node)
 
